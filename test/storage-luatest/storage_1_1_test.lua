@@ -157,3 +157,80 @@ test_group.test_bucket_send_field_types = function(g)
         box.space.test:drop()
     end)
 end
+
+test_group.test_log_fiber = function(g)
+    -- Enable saving messages and states from the background fibers
+    local new_cluster_cfg = table.deepcopy(global_cfg)
+    new_cluster_cfg.log_vshard_background = true
+    vtest.cluster_cfg(g, new_cluster_cfg)
+    vtest.cluster_rebalancer_enable(g)
+
+    -- Make sure all basic fibers save messages
+    g.replica_1_a:exec(function()
+        local basic_storage_fibers = {
+            ivshard.storage.internal.recovery_fiber,
+            ivshard.storage.internal.rebalancer_fiber,
+            ivshard.storage.internal.collect_bucket_garbage_fiber,
+        }
+
+        for _, f in ipairs(basic_storage_fibers) do
+            f:wakeup()
+        end
+
+        ifiber.yield()
+        local fibers_info = ivshard.storage.info().fibers
+        for _, f in ipairs(basic_storage_fibers) do
+            ilt.assert(fibers_info[f:name()])
+        end
+
+        -- Let's create some disbalance
+        ivshard.storage.rebalancer_disable()
+    end)
+
+    -- Test rebalancer applier fiber and its worker
+    g.replica_2_a:exec(function()
+        for i = 1,10 do
+            box.space._bucket:replace{i, ivconst.BUCKET.ACTIVE}
+        end
+
+        rawset(_G, 'errinj', ivshard.storage.internal.errinj)
+        _G.errinj.ERRINJ_LONG_REBALANCER_APPLY_ROUTES = true
+    end)
+
+    g.replica_1_a:exec(function()
+        box.space._bucket:truncate()
+        ivshard.storage.rebalancer_enable()
+        ivshard.storage.rebalancer_wakeup()
+
+        local name = ivshard.storage.internal.rebalancer_fiber:name()
+        _G.wait_for_fiber_msg(ivshard.storage.internal.logf, name,
+                              'Rebalance routes are sent')
+    end)
+
+    g.replica_2_a:exec(function()
+        ilt.helpers.retrying({timeout = iwait_timeout}, function(errinj)
+            if errinj.ERRINJ_LONG_REBALANCER_APPLY_ROUTES ~= 'waiting' then
+                error('Applier haven`t created workers yet')
+            end
+        end, _G.errinj)
+
+        local applier = ivshard.storage.internal.rebalancer_applier_fiber
+        local worker_name = 'vshard.rebalancer_worker_1'
+
+        local fibers = ivshard.storage.info().fibers
+        ilt.assert(fibers[applier:name()])
+        ilt.assert(fibers[worker_name])
+
+        _G.errinj.ERRINJ_LONG_REBALANCER_APPLY_ROUTES = false
+    end)
+
+    -- Cleanup
+    g.replica_2_a:exec(function()
+        _G.errinj = nil
+    end)
+    vtest.cluster_exec_each_master(g, function()
+        box.space._bucket:truncate()
+    end)
+    vtest.cluster_rebalancer_disable(g)
+    vtest.cluster_cfg(g, new_cluster_cfg)
+end

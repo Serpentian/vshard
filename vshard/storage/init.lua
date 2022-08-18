@@ -16,7 +16,7 @@ local MODULE_INTERNALS = '__module_vshard_storage'
 if rawget(_G, MODULE_INTERNALS) then
     local vshard_modules = {
         'vshard.consts', 'vshard.error', 'vshard.cfg', 'vshard.version',
-        'vshard.replicaset', 'vshard.util',
+        'vshard.replicaset', 'vshard.util', 'vshard.log_fiber',
         'vshard.storage.reload_evolution', 'vshard.rlist', 'vshard.registry',
         'vshard.heap', 'vshard.storage.ref', 'vshard.storage.sched',
     }
@@ -31,6 +31,7 @@ local lcfg = require('vshard.cfg')
 local lreplicaset = require('vshard.replicaset')
 local util = require('vshard.util')
 local lregistry = require('vshard.registry')
+local llogf = require('vshard.log_fiber')
 local lref = require('vshard.storage.ref')
 local lsched = require('vshard.storage.sched')
 local reload_evolution = require('vshard.storage.reload_evolution')
@@ -87,6 +88,7 @@ if not M then
             ERRINJ_DISCOVERY = false,
             ERRINJ_BUCKET_GC_PAUSE = false,
             ERRINJ_BUCKET_GC_LONG_REPLICAS_TEST = false,
+            ERRINJ_LONG_REBALANCER_APPLY_ROUTES = false
         },
         -- This counter is used to restart background fibers with
         -- new reloaded code.
@@ -150,6 +152,8 @@ if not M then
         -- conditional checks in one rarely used version of the wrapper and no
         -- checks into the other almost always used wrapper.
         api_call_cache = nil,
+        -- Log wrapper for saving last messages and states from the background fibers
+        logf = nil,
 
         ------------------- Garbage collection -------------------
         -- Fiber to remove garbage buckets data.
@@ -910,6 +914,7 @@ end
 -- possible.
 --
 local function recovery_step_by_type(type)
+    local logf = M.logf
     local _bucket = box.space._bucket
     local is_step_empty = true
     local recovered = 0
@@ -928,9 +933,9 @@ local function recovery_step_by_type(type)
             -- No replicaset master for a bucket. Wait until it
             -- appears.
             if is_step_empty then
-                log.info(start_format, type)
-                log.warn('Can not find for bucket %s its peer %s', bucket_id,
-                         peer_uuid)
+                logf:info(start_format, type)
+                logf:warn('Can not find for bucket %s its peer %s', bucket_id,
+                          peer_uuid)
                 is_step_empty = false
             end
             goto continue
@@ -946,8 +951,8 @@ local function recovery_step_by_type(type)
                     err = 'unknown'
                 end
                 log.info(start_format, type)
-                log.error('Error during recovery of bucket %s on replicaset '..
-                          '%s: %s', bucket_id, peer_uuid, err)
+                logf:error('Error during recovery of bucket %s on replicaset '..
+                           '%s: %s', bucket_id, peer_uuid, err)
                 is_step_empty = false
             end
             goto continue
@@ -976,15 +981,15 @@ local function recovery_step_by_type(type)
             _bucket:replace({bucket_id, consts.BUCKET.ACTIVE})
             recovered = recovered + 1
         elseif is_step_empty then
-            log.info('Bucket %s is %s local and %s on replicaset %s, waiting',
-                     bucket_id, bucket.status, remote_bucket.status, peer_uuid)
+            logf:info('Bucket %s is %s local and %s on replicaset %s, waiting',
+                      bucket_id, bucket.status, remote_bucket.status, peer_uuid)
         end
         is_step_empty = false
 ::continue::
     end
     if not is_step_empty then
-        log.info('Finish bucket recovery step, %d %s buckets are recovered '..
-                 'among %d', recovered, type, total)
+        logf:info('Finish bucket recovery step, %d %s buckets are recovered '..
+                  'among %d', recovered, type, total)
     end
     return total, recovered
 end
@@ -1006,6 +1011,7 @@ local function recovery_f()
     -- Interrupt recovery if a module has been reloaded. Perhaps,
     -- there was found a bug, and reload fixes it.
     while module_version == M.module_version do
+        local logf = M.logf
         if M.errinj.ERRINJ_RECOVERY_PAUSE then
             M.errinj.ERRINJ_RECOVERY_PAUSE = 1
             lfiber.sleep(0.01)
@@ -1016,20 +1022,22 @@ local function recovery_f()
             goto sleep
         end
 
+        logf:set_state('Sending buckets recovery')
         ok, total, recovered = pcall(recovery_step_by_type,
                                      consts.BUCKET.SENDING)
         if not ok then
             is_all_recovered = false
-            log.error('Error during sending buckets recovery: %s', total)
+            logf:error('Error during sending buckets recovery: %s', total)
         elseif total ~= recovered then
             is_all_recovered = false
         end
 
+        logf:set_state('Receiving buckets recovery')
         ok, total, recovered = pcall(recovery_step_by_type,
                                      consts.BUCKET.RECEIVING)
         if not ok then
             is_all_recovered = false
-            log.error('Error during receiving buckets recovery: %s', total)
+            logf:error('Error during receiving buckets recovery: %s', total)
         elseif total == 0 then
             bucket_receiving_quota_reset()
         else
@@ -1040,6 +1048,7 @@ local function recovery_f()
         end
 
     ::sleep::
+        logf:set_state('Sleeping')
         if not is_all_recovered then
             bucket_generation_recovered = -1
         else
@@ -1740,11 +1749,13 @@ local function local_on_master_disable()
     -- Stop garbage collecting
     if M.collect_bucket_garbage_fiber ~= nil then
         M.collect_bucket_garbage_fiber:cancel()
+        M.logf:drop(M.collect_bucket_garbage_fiber:name())
         M.collect_bucket_garbage_fiber = nil
         log.info("GC stopped")
     end
     if M.recovery_fiber ~= nil then
         M.recovery_fiber:cancel()
+        M.logf:drop(M.recovery_fiber:name())
         M.recovery_fiber = nil
         log.info('Recovery stopped')
     end
@@ -2216,19 +2227,22 @@ local function gc_bucket_f()
     local route_map_deadline = 0
     local status, err, is_done
     while M.module_version == module_version do
+        local logf = M.logf
         if M.errinj.ERRINJ_BUCKET_GC_PAUSE then
             M.errinj.ERRINJ_BUCKET_GC_PAUSE = 1
             lfiber.sleep(0.01)
             goto continue
         end
         if bucket_generation_collected ~= bucket_generation_current then
+            logf:set_state('Deleting GARBAGE buckets')
             status, err = gc_bucket_drop(consts.BUCKET.GARBAGE, route_map)
             if status then
+                logf:set_state('Turning SENT buckets into GARBAGE')
                 status, is_done, err = gc_bucket_process_sent()
             end
             if not status then
                 box.rollback()
-                log.error('Error during garbage collection step: %s', err)
+                logf:error('Error during garbage collection step: %s', err)
             elseif is_done then
                 -- Don't use global generation. During the collection it could
                 -- already change. Instead, remember the generation known before
@@ -2280,6 +2294,7 @@ local function gc_bucket_f()
 
         M.bucket_gc_count = M.bucket_gc_count + 1
         if M.module_version == module_version then
+            logf:set_state('Sleeping')
             M.bucket_generation_cond:wait(sleep_time)
         end
     ::continue::
@@ -2573,6 +2588,7 @@ end
 --
 local function rebalancer_worker_f(worker_id, dispenser, quit_cond)
     lfiber.name(string.format('vshard.rebalancer_worker_%d', worker_id))
+    local logf = M.logf
     local _status = box.space._bucket.index.status
     local opts = {timeout = consts.REBALANCER_CHUNK_TIMEOUT}
     local active_key = {consts.BUCKET.ACTIVE}
@@ -2592,41 +2608,43 @@ local function rebalancer_worker_f(worker_id, dispenser, quit_cond)
             end
         end
         if not is_found then
-            log.error('Can not find active buckets')
+            logf:error('Can not find active buckets')
             break
         end
+        logf:set_state('Sending bucket with bucket_id %d', bucket_id)
         local ret, err = bucket_send(bucket_id, uuid, opts)
         if ret then
             worker_throttle_count = 0
             local finished, total = route_dispenser_sent(dispenser, uuid)
             if finished then
-                log.info('%d buckets were successfully sent to %s', total, uuid)
+                logf:info('%d buckets were successfully sent to %s', total, uuid)
             end
             goto continue
         end
         route_dispenser_put(dispenser, uuid)
         if err.type ~= 'ShardingError' or
            err.code ~= lerror.code.TOO_MANY_RECEIVING then
-            log.error('Error during rebalancer routes applying: receiver %s, '..
-                      'error %s', uuid, err)
-            log.info('Can not finish transfers to %s, skip to next round', uuid)
+            logf:error('Error during rebalancer routes applying: receiver %s, '..
+                       'error %s', uuid, err)
+            logf:info('Can not finish transfers to %s, skip to next round', uuid)
             worker_throttle_count = 0
             route_dispenser_skip(dispenser, uuid)
             goto continue
         end
         worker_throttle_count = worker_throttle_count + 1
         if route_dispenser_throttle(dispenser, uuid) then
-            log.error('Too many buckets is being sent to %s', uuid)
+            logf:error('Too many buckets is being sent to %s', uuid)
         end
         if worker_throttle_count < dispenser.rlist.count then
             goto continue
         end
-        log.info('The worker was asked for throttle %d times in a row. '..
-                 'Sleep for %d seconds', worker_throttle_count,
-                 consts.REBALANCER_WORK_INTERVAL)
+        logf:info('The worker was asked for throttle %d times in a row. '..
+                  'Sleep for %d seconds', worker_throttle_count,
+                  consts.REBALANCER_WORK_INTERVAL)
         worker_throttle_count = 0
+        logf:set_state('Sleeping')
         if not quit_cond:wait(consts.REBALANCER_WORK_INTERVAL) then
-            log.info('The worker is back')
+            logf:info('The worker is back')
         end
 ::continue::
         uuid = route_dispenser_pop(dispenser)
@@ -2639,11 +2657,13 @@ end
 -- logs total results.
 --
 local function rebalancer_apply_routes_f(routes)
+    local logf = M.logf
     lfiber.name('vshard.rebalancer_applier')
     local worker_count = M.rebalancer_worker_count
     setmetatable(routes, {__serialize = 'mapping'})
-    log.info('Apply rebalancer routes with %d workers:\n%s', worker_count,
-             yaml_encode(routes))
+    logf:set_state('Creating workers for applying routes')
+    logf:info('Apply rebalancer routes with %d workers:\n%s', worker_count,
+              yaml_encode(routes))
     local dispenser = route_dispenser_create(routes)
     local _status = box.space._bucket.index.status
     assert(_status:count({consts.BUCKET.SENDING}) == 0)
@@ -2660,15 +2680,24 @@ local function rebalancer_apply_routes_f(routes)
         f:set_joinable(true)
         workers[i] = f
     end
-    log.info('Rebalancer workers have started, wait for their termination')
+
+    logf:set_state('Waiting for workers to apply routes')
+    logf:info('Rebalancer workers have started, wait for their termination')
+    if M.errinj.ERRINJ_LONG_REBALANCER_APPLY_ROUTES then
+        M.errinj.ERRINJ_LONG_REBALANCER_APPLY_ROUTES = 'waiting'
+        while M.errinj.ERRINJ_LONG_REBALANCER_APPLY_ROUTES do
+            lfiber.sleep(0.01)
+        end
+    end
     for i = 1, worker_count do
         local f = workers[i]
         local ok, res = f:join()
+        M.logf:drop(f:name())
         if not ok then
-            log.error('Rebalancer worker %d threw an exception: %s', i, res)
+            logf:error('Rebalancer worker %d threw an exception: %s', i, res)
         end
     end
-    log.info('Rebalancer routes are applied')
+    logf:info('Rebalancer routes are applied')
     local throttled = {}
     for uuid, dst in pairs(dispenser.map) do
         if dst.is_throttle_warned then
@@ -2676,11 +2705,12 @@ local function rebalancer_apply_routes_f(routes)
         end
     end
     if next(throttled) then
-        log.warn('Note, the replicasets {%s} reported too many receiving '..
-                 'buckets. Perhaps you need to increase '..
-                 '"rebalancer_max_receiving" or decrease '..
-                 '"rebalancer_worker_count"', table.concat(throttled, ', '))
+        logf:warn('Note, the replicasets {%s} reported too many receiving '..
+                  'buckets. Perhaps you need to increase '..
+                  '"rebalancer_max_receiving" or decrease '..
+                  '"rebalancer_worker_count"', table.concat(throttled, ', '))
     end
+    M.logf:drop(lfiber.self():name())
 end
 
 --
@@ -2732,9 +2762,9 @@ local function rebalancer_download_states()
     if sum == M.total_bucket_count then
         return replicasets, total_bucket_active_count
     else
-        log.info('Total active bucket count is not equal to total. '..
-                 'Possibly a boostrap is not finished yet. Expected %d, but '..
-                 'found %d', M.total_bucket_count, sum)
+        M.logf:info('Total active bucket count is not equal to total. '..
+                    'Possibly a boostrap is not finished yet. Expected %d, but '..
+                    'found %d', M.total_bucket_count, sum)
     end
 end
 
@@ -2745,10 +2775,14 @@ end
 local function rebalancer_f()
     local module_version = M.module_version
     while module_version == M.module_version do
+        local logf = M.logf
         while not M.is_rebalancer_active do
-            log.info('Rebalancer is disabled. Sleep')
+            logf:set_state('Sleeping')
+            logf:info('Rebalancer is disabled. Sleep')
             lfiber.sleep(consts.REBALANCER_IDLE_INTERVAL)
         end
+
+        logf:set_state('Downloading bucket states')
         local status, replicasets, total_bucket_active_count =
             pcall(rebalancer_download_states)
         if M.module_version ~= module_version then
@@ -2756,10 +2790,11 @@ local function rebalancer_f()
         end
         if not status or replicasets == nil then
             if not status then
-                log.error('Error during downloading rebalancer states: %s',
-                          replicasets)
+                logf:error('Error during downloading rebalancer states: %s',
+                           replicasets)
             end
-            log.info('Some buckets are not active, retry rebalancing later')
+            logf:info('Some buckets are not active, retry rebalancing later')
+            logf:set_state('Sleeping')
             lfiber.sleep(consts.REBALANCER_WORK_INTERVAL)
             goto continue
         end
@@ -2781,30 +2816,34 @@ local function rebalancer_f()
             else
                 balance_msg = 'The cluster is balanced ok.'
             end
-            log.info('%s Schedule next rebalancing after %f seconds',
-                     balance_msg, consts.REBALANCER_IDLE_INTERVAL)
+            logf:info('%s Schedule next rebalancing after %f seconds',
+                      balance_msg, consts.REBALANCER_IDLE_INTERVAL)
+            logf:set_state('Sleeping')
             lfiber.sleep(consts.REBALANCER_IDLE_INTERVAL)
             goto continue
         end
+        logf:set_state('Building rebalancing routes')
         local routes = rebalancer_build_routes(replicasets)
         -- Routes table can not be empty. If it had been empty,
         -- then max_disbalance would have been calculated
         -- incorrectly.
         assert(next(routes) ~= nil)
+        logf:set_state('Applying rebalancing routes')
         for src_uuid, src_routes in pairs(routes) do
             local rs = M.replicasets[src_uuid]
             local status, err =
                 rs:callrw('vshard.storage.rebalancer_apply_routes',
                           {src_routes})
             if not status then
-                log.error('Error during routes appying on "%s": %s. '..
-                          'Try rebalance later', rs, lerror.make(err))
+                logf:error('Error during routes appying on "%s": %s. '..
+                           'Try rebalance later', rs, lerror.make(err))
                 lfiber.sleep(consts.REBALANCER_WORK_INTERVAL)
                 goto continue
             end
         end
-        log.info('Rebalance routes are sent. Schedule next wakeup after '..
-                 '%f seconds', consts.REBALANCER_WORK_INTERVAL)
+        logf:info('Rebalance routes are sent. Schedule next wakeup after '..
+                  '%f seconds', consts.REBALANCER_WORK_INTERVAL)
+        logf:set_state('Sleeping')
         lfiber.sleep(consts.REBALANCER_WORK_INTERVAL)
 ::continue::
     end
@@ -3156,6 +3195,12 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
     M.rebalancer_worker_count = vshard_cfg.rebalancer_max_sending
     M.current_cfg = cfg
 
+    if not M.logf then
+        M.logf = llogf.new(vshard_cfg)
+    else
+        M.logf:cfg(vshard_cfg)
+    end
+
     if was_master and not is_master then
         local_on_master_disable()
     end
@@ -3177,6 +3222,7 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
     elseif M.rebalancer_fiber then
         log.info('Rebalancer location has changed to %s', min_master)
         M.rebalancer_fiber:cancel()
+        M.logf:drop(M.rebalancer_fiber:name())
         M.rebalancer_fiber = nil
     end
     M.is_configured = true
@@ -3216,6 +3262,7 @@ local function storage_info()
         replication = {},
         bucket = {},
         status = consts.STATUS.GREEN,
+        fibers = M.logf:get_info()
     }
     local code = lerror.code
     local alert = lerror.alert

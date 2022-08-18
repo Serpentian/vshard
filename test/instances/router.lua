@@ -28,4 +28,10 @@ end
 box.cfg(helpers.box_cfg())
 box.schema.user.grant('guest', 'super', nil, nil, {if_not_exists = true})
 
+-- Export to the global all common methods
+local common = require('test.instances.common')
+for name, func in pairs(common) do
+    rawset(_G, name, func)
+end
+
 _G.ready = true

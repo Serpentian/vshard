@@ -157,4 +157,10 @@ _G.bucket_recovery_pause = bucket_recovery_pause
 _G.bucket_recovery_continue = bucket_recovery_continue
 _G.wal_sync = wal_sync
 
+-- Export to the global all common methods
+local common = require('test.instances.common')
+for name, func in pairs(common) do
+    rawset(_G, name, func)
+end
+
 _G.ready = true
