@@ -576,3 +576,41 @@ g.test_explicit_fiber_kill = function(g)
         end
     end, {bids})
 end
+
+g.test_log_fiber = function(g)
+    -- Enable master search fiber and logging of the background fibers
+    local new_cfg_template = table.deepcopy(cfg_template)
+    for _, rs in pairs(new_cfg_template.sharding) do
+        rs.master = 'auto'
+        for _, r in pairs(rs.replicas) do
+            r.master = nil
+        end
+    end
+
+    local new_cluster_cfg = vtest.config_new(new_cfg_template)
+    new_cluster_cfg.log_vshard_background = true
+    new_cluster_cfg.log_level = 7
+    vtest.router_cfg(g.router, new_cluster_cfg)
+
+    -- Make sure that logging is working for every background fiber
+    g.router:exec(function()
+        local router_fibers = {
+            ivshard.router.static.discovery_fiber,
+            ivshard.router.static.failover_fiber,
+            ivshard.router.static.master_search_fiber,
+        }
+
+        for _, f in ipairs(router_fibers) do
+            f:wakeup()
+        end
+
+        ifiber.yield()
+        local fibers_info = ivshard.router.info().fibers
+        for _, f in ipairs(router_fibers) do
+            ilt.assert(fibers_info[f:name()])
+        end
+    end)
+
+    -- Restore everything back.
+    vtest.router_cfg(g.router, global_cfg)
+end

@@ -9,7 +9,7 @@ local MODULE_INTERNALS = '__module_vshard_router'
 if rawget(_G, MODULE_INTERNALS) then
     local vshard_modules = {
         'vshard.consts', 'vshard.error', 'vshard.cfg', 'vshard.version',
-        'vshard.hash', 'vshard.replicaset', 'vshard.util'
+        'vshard.hash', 'vshard.replicaset', 'vshard.fiber_logger', 'vshard.util'
     }
     for _, module in pairs(vshard_modules) do
         package.loaded[module] = nil
@@ -20,6 +20,7 @@ local lerror = require('vshard.error')
 local lcfg = require('vshard.cfg')
 local lhash = require('vshard.hash')
 local lreplicaset = require('vshard.replicaset')
+local llogf = require('vshard.log_fiber')
 local util = require('vshard.util')
 local seq_serializer = { __serialize = 'seq' }
 
@@ -98,6 +99,8 @@ local ROUTER_TEMPLATE = {
         -- when no timeout is specified.
         --
         sync_timeout = consts.DEFAULT_SYNC_TIMEOUT,
+        -- Log wrapper for saving last messages and states from the background fibers
+        logf = nil,
         -- Flag whether router_cfg() is finished.
         is_configured = false,
         -- Flag whether the instance is enabled manually. It is true by default
@@ -218,6 +221,7 @@ end
 -- reference a given replicaset.
 --
 local function discovery_handle_buckets(router, replicaset, buckets)
+    local logf = router.logf
     local count = replicaset.bucket_count
     local affected = {}
     for _, bucket_id in pairs(buckets) do
@@ -237,13 +241,13 @@ local function discovery_handle_buckets(router, replicaset, buckets)
         end
     end
     if count ~= replicaset.bucket_count then
-        log.info('Updated %s buckets: was %d, became %d', replicaset,
-                 replicaset.bucket_count, count)
+        logf:info('Updated %s buckets: was %d, became %d', replicaset,
+                  replicaset.bucket_count, count)
     end
     replicaset.bucket_count = count
     for rs, old_bucket_count in pairs(affected) do
-        log.info('Affected buckets of %s: was %d, became %d', rs,
-                 old_bucket_count, rs.bucket_count)
+        logf:info('Affected buckets of %s: was %d, became %d', rs,
+                  old_bucket_count, rs.bucket_count)
     end
 end
 
@@ -257,6 +261,7 @@ local function discovery_f(router)
     local opts = {is_async = true}
     local mode
     while module_version == M.module_version do
+        local logf = router.logf
         -- Just typical map reduce - send request to each
         -- replicaset in parallel, and collect responses. Many
         -- requests probably will be needed for each replicaset.
@@ -264,6 +269,7 @@ local function discovery_f(router)
         -- Step 1: create missing iterators, in case this is a
         -- first discovery iteration, or some replicasets were
         -- added after the router is started.
+        logf:set_state('Creating missing iterators')
         for rs_uuid in pairs(router.replicasets) do
             local iter = iterators[rs_uuid]
             if not iter then
@@ -276,10 +282,11 @@ local function discovery_f(router)
         -- Step 2: map stage - send parallel requests for every
         -- iterator, prune orphan iterators whose replicasets were
         -- removed.
+        logf:set_state('Discovering buckets')
         for rs_uuid, iter in pairs(iterators) do
             local replicaset = router.replicasets[rs_uuid]
             if not replicaset then
-                log.warn('Replicaset %s was removed during discovery', rs_uuid)
+                logf:warn('Replicaset %s was removed during discovery', rs_uuid)
                 iterators[rs_uuid] = nil
                 goto continue
             end
@@ -287,8 +294,8 @@ local function discovery_f(router)
                 replicaset:callro('vshard.storage.buckets_discovery', iter.args,
                                   opts)
             if not future then
-                log.warn('Error during discovery %s, retry will be done '..
-                         'later: %s', rs_uuid, err)
+                logf:warn('Error during discovery %s, retry will be done '..
+                          'later: %s', rs_uuid, err)
                 goto continue
             end
             iter.future = future
@@ -315,14 +322,15 @@ local function discovery_f(router)
             end
             if not result then
                 future:discard()
-                log.warn('Error during discovery %s, retry will be done '..
-                         'later: %s', rs_uuid, err)
+                logf:set_state('Error')
+                logf:warn('Error during discovery %s, retry will be done '..
+                          'later: %s', rs_uuid, err)
                 goto continue
             end
             local replicaset = router.replicasets[rs_uuid]
             if not replicaset then
                 iterators[rs_uuid] = nil
-                log.warn('Replicaset %s was removed during discovery', rs_uuid)
+                logf:warn('Replicaset %s was removed during discovery', rs_uuid)
                 goto continue
             end
             result = result[1]
@@ -340,40 +348,43 @@ local function discovery_f(router)
             end
             ::continue::
         end
+        logf:set_state('Sleeping')
         local unknown_bucket_count
         repeat
             unknown_bucket_count =
                 router.total_bucket_count - router.known_bucket_count
             if unknown_bucket_count == 0 then
                 if router.discovery_mode == 'once' then
+                    -- No need to log into log_fiber as it will be dropped anyway
                     log.info("Discovery mode is 'once', and all is "..
                              "discovered - shut down the discovery process")
+                    logf:drop(router.discovery_fiber:name())
                     router.discovery_fiber = nil
                     lfiber.self():cancel()
                     return
                 end
                 if mode ~= 'idle' then
-                    log.info('Discovery enters idle mode, all buckets are '..
-                             'known. Discovery works with %s seconds '..
-                             'interval now', consts.DISCOVERY_IDLE_INTERVAL)
+                    logf:info('Discovery enters idle mode, all buckets are '..
+                              'known. Discovery works with %s seconds '..
+                              'interval now', consts.DISCOVERY_IDLE_INTERVAL)
                     mode = 'idle'
                 end
                 lfiber.sleep(consts.DISCOVERY_IDLE_INTERVAL)
             elseif not next(router.replicasets) then
                 if mode ~= 'idle' then
-                    log.info('Discovery enters idle mode because '..
-                             'configuration does not have replicasets. '..
-                             'Retries will happen with %s seconds interval',
+                    logf:info('Discovery enters idle mode because '..
+                              'configuration does not have replicasets. '..
+                              'Retries will happen with %s seconds interval',
                              consts.DISCOVERY_IDLE_INTERVAL)
                     mode = 'idle'
                 end
                 lfiber.sleep(consts.DISCOVERY_IDLE_INTERVAL)
             else
                 if mode ~= 'aggressive' then
-                    log.info('Start aggressive discovery, %s buckets are '..
-                             'unknown. Discovery works with %s seconds '..
-                             'interval', unknown_bucket_count,
-                             consts.DISCOVERY_WORK_INTERVAL)
+                    logf:info('Start aggressive discovery, %s buckets are '..
+                              'unknown. Discovery works with %s seconds '..
+                              'interval', unknown_bucket_count,
+                               consts.DISCOVERY_WORK_INTERVAL)
                     mode = 'aggressive'
                 end
                 lfiber.sleep(consts.DISCOVERY_WORK_INTERVAL)
@@ -404,6 +415,7 @@ local function discovery_set(router, new_mode)
     router.discovery_mode = new_mode
     if router.discovery_fiber ~= nil then
         pcall(router.discovery_fiber.cancel, router.discovery_fiber)
+        router.logf:drop(router.discovery_fiber:name())
         router.discovery_fiber = nil
     end
     if new_mode == 'off' then
@@ -943,14 +955,15 @@ end
 --------------------------------------------------------------------------------
 
 local function failover_ping_round(router)
+    local logf = router.logf
     for _, replicaset in pairs(router.replicasets) do
         local replica = replicaset.replica
         if replica ~= nil and replica.conn ~= nil and
            replica.down_ts == nil then
             if not replica.conn:ping({timeout =
                                       router.failover_ping_timeout}) then
-                log.info('Ping error from %s: perhaps a connection is down',
-                         replica)
+                logf:info('Ping error from %s: perhaps a connection is down',
+                          replica)
                 -- Connection hangs. Recreate it to be able to
                 -- fail over to a replica next by priority. The
                 -- old connection is not closed in case if it just
@@ -1011,6 +1024,8 @@ end
 -- @retval true A replica of an replicaset has been changed.
 --
 local function failover_step(router)
+    local logf = router.logf
+    logf:set_state('Collecting not optimal or disconnected replicas')
     failover_ping_round(router)
     local uuid_to_update = failover_collect_to_update(router)
     if #uuid_to_update == 0 then
@@ -1018,6 +1033,7 @@ local function failover_step(router)
     end
     local curr_ts = fiber_clock()
     local replica_is_changed = false
+    logf:set_state('Processing not optimal or disconnected replicas')
     for _, uuid in pairs(uuid_to_update) do
         local rs = router.replicasets[uuid]
         if M.errinj.ERRINJ_FAILOVER_CHANGE_CFG then
@@ -1025,7 +1041,7 @@ local function failover_step(router)
             M.errinj.ERRINJ_FAILOVER_CHANGE_CFG = false
         end
         if rs == nil then
-            log.info('Configuration has changed, restart failovering')
+            logf:info('Configuration has changed, restart failovering')
             lfiber.yield()
             return true
         end
@@ -1040,7 +1056,7 @@ local function failover_step(router)
             rs:down_replica_priority()
         end
         if old_replica ~= rs.replica then
-            log.info('New replica %s for %s', rs.replica, rs)
+            logf:info('New replica %s for %s', rs.replica, rs)
             replica_is_changed = true
         end
 ::continue::
@@ -1074,25 +1090,27 @@ local function failover_f(router)
     -- each min_timeout seconds.
     local prev_was_ok = false
     while module_version == M.module_version do
+        local logf = router.logf
         local ok, replica_is_changed = pcall(failover_step, router)
         if not ok then
-            log.error('Error during failovering: %s',
-                      lerror.make(replica_is_changed))
+            logf:error('Error during failovering: %s',
+                       lerror.make(replica_is_changed))
             replica_is_changed = true
         elseif not prev_was_ok then
-            log.info('All replicas are ok')
+            logf:info('All replicas are ok')
         end
         prev_was_ok = not replica_is_changed
-        local logf
+        local logf_temp
         if replica_is_changed then
-            logf = log.info
+            logf_temp = logf.info
         else
             -- In any case it is necessary to periodically log
             -- failover heartbeat.
-            logf = log.verbose
+            logf_temp = logf.verbose
         end
-        logf('Failovering step is finished. Schedule next after %f seconds',
-             min_timeout)
+        logf_temp(router.logf, 'Failovering step is finished. Schedule next after %f seconds',
+                  min_timeout)
+        logf:set_state('Sleeping')
         lfiber.sleep(min_timeout)
     end
 end
@@ -1126,6 +1144,8 @@ local function master_search_f(router)
     local is_in_progress = false
     local errinj = M.errinj
     while module_version == M.module_version do
+        local logf = router.logf
+        logf:set_state('Searching for the masters')
         if errinj.ERRINJ_MASTER_SEARCH_DELAY then
             errinj.ERRINJ_MASTER_SEARCH_DELAY = 'in'
             repeat
@@ -1136,7 +1156,7 @@ local function master_search_f(router)
         local start_time = fiber_clock()
         local is_done, is_nop, err = master_search_step(router)
         if err then
-            log.error('Error during master search: %s', lerror.make(err))
+            logf:error('Error during master search: %s', lerror.make(err))
         end
         if is_done then
             timeout = consts.MASTER_SEARCH_IDLE_INTERVAL
@@ -1147,21 +1167,22 @@ local function master_search_f(router)
         end
         if not is_in_progress then
             if not is_nop and is_done then
-                log.info('Master search happened')
+                logf:info('Master search happened')
             elseif not is_done then
-                log.info('Master search is started')
+                logf:info('Master search is started')
                 is_in_progress = true
             end
         elseif is_done then
-            log.info('Master search is finished')
+            logf:info('Master search is finished')
             is_in_progress = false
         end
         local end_time = fiber_clock()
         local duration = end_time - start_time
         if not is_nop then
-            log.verbose('Master search step took %s seconds. Next in %s '..
-                        'seconds', duration, timeout)
+            logf:verbose('Master search step took %s seconds. Next in %s '..
+                         'seconds', duration, timeout)
         end
+        logf:set_state('Sleeping')
         lfiber.sleep(timeout)
     end
 end
@@ -1184,6 +1205,7 @@ local function master_search_set(router)
         -- Do not make users pay for what they do not use - when the search is
         -- disabled for all replicasets, there should not be any fiber.
         log.info('Master auto search is disabled')
+        router.logf:drop(search_fiber:name())
         if search_fiber:status() ~= 'dead' then
             search_fiber:cancel()
         end
@@ -1228,6 +1250,7 @@ local function router_cfg(router, cfg, is_reload)
             lfiber.sleep(0.01)
         end
     end
+
     -- Move connections from an old configuration to a new one.
     -- It must be done with no yields to prevent usage both of not
     -- fully moved old replicasets, and not fully built new ones.
@@ -1258,6 +1281,13 @@ local function router_cfg(router, cfg, is_reload)
         end
     end
     router.known_bucket_count = known_bucket_count
+
+    if not router.logf then
+        router.logf = llogf.new(vshard_cfg)
+    else
+        router.logf:cfg(vshard_cfg)
+    end
+
     if router.failover_fiber == nil then
         router.failover_fiber = util.reloadable_fiber_create(
             'vshard.failover.' .. router.name, M, 'failover_f', router)
@@ -1381,6 +1411,7 @@ local function router_info(router)
         },
         alerts = {},
         status = consts.STATUS.GREEN,
+        fibers = router.logf:get_info(),
     }
     local bucket_info = state.bucket
     for _, replicaset in pairs(router.replicasets) do
