@@ -131,9 +131,10 @@ end
 --
 local function reloadable_fiber_create(fiber_name, module, func_name, data)
     assert(type(fiber_name) == 'string')
-    local xfiber = fiber.create(reloadable_fiber_main_loop, module, func_name,
-                                data)
+    -- fiber.new() as it allows to set the fiber's name before its start
+    local xfiber = fiber.new(reloadable_fiber_main_loop, module, func_name, data)
     xfiber:name(fiber_name, {truncate = true})
+    fiber.yield()
     return xfiber
 end
 
