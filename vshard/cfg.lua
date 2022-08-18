@@ -327,6 +327,10 @@ local cfg_template = {
         name = 'Scheduler bucket move quota', type = 'non-negative number',
         is_optional = true, default = consts.DEFAULT_SCHED_MOVE_QUOTA
     },
+    log_vshard_background = {
+        name = 'Number of saved messages for background fibers',
+        type = {'boolean', 'non-negative number'}, is_optional = true
+    },
 }
 
 --
