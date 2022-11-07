@@ -58,11 +58,21 @@ vshard.storage.bucket_force_create(1)
 vshard.storage.buckets_info()
 ok, err = vshard.storage.bucket_force_create(1)
 assert(not ok and err.message:match("Duplicate key exists"))
-vshard.storage.bucket_force_drop(1)
+test_run:switch('storage_1_b')
+vshard.storage.internal.is_bucket_protected = false
 
+test_run:switch('storage_1_a')
+vshard.storage.internal.is_bucket_protected = false
+vshard.storage.bucket_force_drop(1)
+vshard.storage.internal.is_bucket_protected = true
 vshard.storage.buckets_info()
 vshard.storage.bucket_force_create(1)
 vshard.storage.bucket_force_create(2)
+vshard.storage.sync(50)
+
+test_run:switch('storage_1_b')
+vshard.storage.internal.is_bucket_protected = false
+
 _ = test_run:switch("storage_2_a")
 vshard.storage.bucket_force_create(3)
 vshard.storage.bucket_force_create(4)
@@ -211,10 +221,14 @@ rs:callro('echo', {'some_data'})
 -- Cleanup after the previous tests.
 _ = test_run:switch('storage_1_a')
 buckets = vshard.storage.buckets_info()
+vshard.storage.internal.is_bucket_protected = false
 for bid, _ in pairs(buckets) do vshard.storage.bucket_force_drop(bid) end
+vshard.storage.internal.is_bucket_protected = true
 _ = test_run:switch('storage_2_a')
 buckets = vshard.storage.buckets_info()
+vshard.storage.internal.is_bucket_protected = false
 for bid, _ in pairs(buckets) do vshard.storage.bucket_force_drop(bid) end
+vshard.storage.internal.is_bucket_protected = true
 
 _ = test_run:switch('storage_1_a')
 assert(vshard.storage.buckets_count() == 0)
@@ -263,7 +277,9 @@ _ = fiber.create(function()                                                     
 end)
 fiber.sleep(small_timeout)
 assert(not ok and not err)
+vshard.storage.internal.is_bucket_protected = false
 vshard.storage.bucket_force_drop(10)
+vshard.storage.internal.is_bucket_protected = true
 test_run:wait_cond(function() return ok or err end)
 assert(ok)
 

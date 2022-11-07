@@ -159,7 +159,9 @@ test_run:wait_cond(function() return lref.count == 0 end)
 --
 _ = test_run:switch('storage_1_a')
 bucket_id = box.space._bucket.index.pk:min().id
+vshard.storage.internal.is_bucket_protected = false
 vshard.storage.bucket_force_drop(bucket_id)
+vshard.storage.internal.is_bucket_protected = true
 
 _ = test_run:switch('router_1')
 ok, err = vshard.router.map_callrw('echo', {1}, big_timeout_opts)
@@ -172,7 +174,9 @@ vshard.storage.bucket_force_create(bucket_id)
 _ = test_run:switch('storage_2_a')
 test_run:wait_cond(function() return lref.count == 0 end)
 bucket_id = box.space._bucket.index.pk:min().id
+vshard.storage.internal.is_bucket_protected = false
 vshard.storage.bucket_force_drop(bucket_id)
+vshard.storage.internal.is_bucket_protected = true
 
 _ = test_run:switch('router_1')
 ok, err = vshard.router.map_callrw('echo', {1}, big_timeout_opts)

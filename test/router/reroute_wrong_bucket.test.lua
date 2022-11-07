@@ -27,7 +27,9 @@ util = require('util')
 vshard.router.bucket_discovery(100) ~= nil
 
 test_run:switch('storage_1_a')
+vshard.storage.internal.is_bucket_protected = false
 box.space._bucket:update({100}, {{'=', 2, vshard.consts.BUCKET.SENT}, {'=', 3, util.replicasets[2]}})
+vshard.storage.internal.is_bucket_protected = true
 
 test_run:switch('storage_2_a')
 box.space._bucket:replace{100, vshard.consts.BUCKET.ACTIVE}
@@ -41,7 +43,9 @@ vshard.router.call(100, 'write', 'space_insert', {'test', {2, 100}}, {timeout = 
 
 -- Create cycle.
 test_run:switch('storage_2_a')
+vshard.storage.internal.is_bucket_protected = false
 box.space._bucket:update({100}, {{'=', 2, vshard.consts.BUCKET.SENT}, {'=', 3, util.replicasets[1]}})
+vshard.storage.internal.is_bucket_protected = true
 
 test_run:switch('router_1')
 _ = vshard.router.call(100, 'read', 'space_get', {'test', {1}}, {timeout = 1})
@@ -50,9 +54,13 @@ _ = vshard.router.call(100, 'read', 'space_get', {'test', {1}}, {timeout = 1})
 -- found by bucket.destination from WRONG_BUCKET or
 -- TRANSFER_IS_IN_PROGRESS error object.
 test_run:switch('storage_2_a')
+vshard.storage.internal.is_bucket_protected = false
 box.space._bucket:replace({100, vshard.consts.BUCKET.ACTIVE})
+vshard.storage.internal.is_bucket_protected = true
 test_run:switch('storage_1_a')
+vshard.storage.internal.is_bucket_protected = false
 box.space._bucket:replace({100, vshard.consts.BUCKET.SENT, util.replicasets[2]})
+vshard.storage.internal.is_bucket_protected = true
 test_run:switch('router_1')
 -- Emulate a situation, when a replicaset_2 while is unknown for
 -- router, but is already known for storages.

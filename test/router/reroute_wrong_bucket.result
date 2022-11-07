@@ -80,9 +80,15 @@ test_run:switch('storage_1_a')
 ---
 - true
 ...
+vshard.storage.internal.is_bucket_protected = false
+---
+...
 box.space._bucket:update({100}, {{'=', 2, vshard.consts.BUCKET.SENT}, {'=', 3, util.replicasets[2]}})
 ---
 - [100, 'sent', 'ac522f65-aa94-4134-9f64-51ee384f1a54']
+...
+vshard.storage.internal.is_bucket_protected = true
+---
 ...
 test_run:switch('storage_2_a')
 ---
@@ -116,9 +122,15 @@ test_run:switch('storage_2_a')
 ---
 - true
 ...
+vshard.storage.internal.is_bucket_protected = false
+---
+...
 box.space._bucket:update({100}, {{'=', 2, vshard.consts.BUCKET.SENT}, {'=', 3, util.replicasets[1]}})
 ---
 - [100, 'sent', 'cbf06940-0790-498b-948d-042b62cf3d29']
+...
+vshard.storage.internal.is_bucket_protected = true
+---
 ...
 test_run:switch('router_1')
 ---
@@ -134,17 +146,29 @@ test_run:switch('storage_2_a')
 ---
 - true
 ...
+vshard.storage.internal.is_bucket_protected = false
+---
+...
 box.space._bucket:replace({100, vshard.consts.BUCKET.ACTIVE})
 ---
 - [100, 'active']
+...
+vshard.storage.internal.is_bucket_protected = true
+---
 ...
 test_run:switch('storage_1_a')
 ---
 - true
 ...
+vshard.storage.internal.is_bucket_protected = false
+---
+...
 box.space._bucket:replace({100, vshard.consts.BUCKET.SENT, util.replicasets[2]})
 ---
 - [100, 'sent', 'ac522f65-aa94-4134-9f64-51ee384f1a54']
+...
+vshard.storage.internal.is_bucket_protected = true
+---
 ...
 test_run:switch('router_1')
 ---

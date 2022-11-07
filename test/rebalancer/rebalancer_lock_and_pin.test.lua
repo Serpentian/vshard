@@ -185,6 +185,7 @@ box.space._bucket:get{first_id}.status
 
 -- Test that can not pin other buckets.
 test_run:cmd("setopt delimiter ';'")
+vshard.storage.internal.is_bucket_protected = false
 box.begin()
 box.space._bucket:update({first_id}, {{'=', 2, vshard.consts.BUCKET.SENDING}})
 ok, err = vshard.storage.bucket_pin(first_id)
@@ -207,6 +208,7 @@ assert(not ok and err)
 ok, err = vshard.storage.bucket_unpin(first_id)
 assert(not ok and err)
 box.rollback()
+vshard.storage.internal.is_bucket_protected = true
 test_run:cmd("setopt delimiter ''");
 
 --

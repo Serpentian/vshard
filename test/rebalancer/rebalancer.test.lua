@@ -150,7 +150,12 @@ wait_rebalancer_state("Rebalancer is disabled", test_run)
 -- sent.
 -- (See point (6) in the test plan)
 --
+test_run:switch('box_1_b')
+vshard.storage.internal.is_bucket_protected = false
+
+test_run:switch('box_1_a')
 vshard.storage.rebalancer_enable()
+vshard.storage.internal.is_bucket_protected = false
 _bucket:update({150}, {{'=', 2, vshard.consts.BUCKET.RECEIVING}})
 wait_rebalancer_state("Some buckets are not active", test_run)
 _bucket:update({150}, {{'=', 2, vshard.consts.BUCKET.ACTIVE}})
@@ -161,6 +166,12 @@ _bucket:update({150}, {{'=', 2, vshard.consts.BUCKET.ACTIVE}})
 --
 vshard.storage.rebalancer_disable()
 for i = 91, 100 do _bucket:replace{i, vshard.consts.BUCKET.ACTIVE} end
+vshard.storage.internal.is_bucket_protected = true
+vshard.storage.sync(50)
+test_run:switch('box_1_b')
+vshard.storage.internal.is_bucket_protected = true
+
+test_run:switch('box_1_a')
 space = box.space.test
 space:replace{1, 91}
 space:replace{2, 92}
@@ -170,7 +181,9 @@ space:replace{5, 151}
 
 test_run:switch('box_2_a')
 space = box.space.test
+vshard.storage.internal.is_bucket_protected = false
 for i = 91, 100 do _bucket:delete{i} end
+vshard.storage.internal.is_bucket_protected = true
 
 test_run:switch('box_1_a')
 _bucket:get{91}.status

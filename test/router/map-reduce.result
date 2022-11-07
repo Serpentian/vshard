@@ -394,9 +394,15 @@ _ = test_run:switch('storage_1_a')
 bucket_id = box.space._bucket.index.pk:min().id
  | ---
  | ...
+vshard.storage.internal.is_bucket_protected = false
+ | ---
+ | ...
 vshard.storage.bucket_force_drop(bucket_id)
  | ---
  | - true
+ | ...
+vshard.storage.internal.is_bucket_protected = true
+ | ---
  | ...
 
 _ = test_run:switch('router_1')
@@ -432,9 +438,15 @@ test_run:wait_cond(function() return lref.count == 0 end)
 bucket_id = box.space._bucket.index.pk:min().id
  | ---
  | ...
+vshard.storage.internal.is_bucket_protected = false
+ | ---
+ | ...
 vshard.storage.bucket_force_drop(bucket_id)
  | ---
  | - true
+ | ...
+vshard.storage.internal.is_bucket_protected = true
+ | ---
  | ...
 
 _ = test_run:switch('router_1')

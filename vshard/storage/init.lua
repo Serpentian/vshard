@@ -321,6 +321,11 @@ local function bucket_reject_update(bid, message, ...)
                         message:format(...)))
 end
 
+local function bucket_reject_update_transition(bid, old_status, new_status)
+    bucket_reject_update(bid, "bucket transition from '%s' to '%s' " ..
+                         "is prohibited", old_status, new_status)
+end
+
 --
 -- Make _bucket-related data up to date with the committed changes.
 --
@@ -361,12 +366,63 @@ local function bucket_commit_delete(bucket)
 end
 
 --
--- Validate whether _bucket update is possible. Bad ones need to be rejected for
--- the sake of keeping data consistency. Ideally it should never throw. But
--- there sure are bugs and this trigger should help to catch them from time to
--- time.
+-- Ensure that a bucket status update is one of these:
+--  * none -> RECEIVING
+--  * RECEIVING -> GARBAGE
+--  * RECEIVING -> ACTIVE
+--  * PINNED <-> ACTIVE <-> SENDING -> SENT -> GARBAGE -> none
 --
-local function bucket_prepare_update(old_bucket, new_bucket)
+local function bucket_validate_update_transition(old_bucket, new_bucket)
+    local new_status = new_bucket.status
+    local bid = new_bucket.id
+    if old_bucket == nil then
+        if new_status ~= BSTATE.RECEIVING then
+            bucket_reject_update(bid, "can't create bucket with '%s' status",
+                                 new_status)
+        end
+        return
+    end
+    local old_status = old_bucket.status
+    if new_status == old_status then
+        return
+    end
+    if new_status == BSTATE.RECEIVING then
+        bucket_reject_update_transition(bid, old_status, new_status)
+    end
+    if new_status == BSTATE.GARBAGE then
+        if old_status ~= BSTATE.RECEIVING and old_status ~= BSTATE.SENT then
+            bucket_reject_update_transition(bid, old_status, new_status)
+        end
+        return
+    end
+    if new_status == BSTATE.PINNED or new_status == BSTATE.SENDING then
+        if old_status ~= BSTATE.ACTIVE then
+            bucket_reject_update_transition(bid, old_status, new_status)
+        end
+        return
+    end
+    if new_status == BSTATE.ACTIVE then
+        if old_status ~= BSTATE.RECEIVING and old_status ~= BSTATE.PINNED and
+                old_status ~= BSTATE.SENDING then
+            bucket_reject_update_transition(bid, old_status, new_status)
+        end
+        return
+    end
+    if new_status == BSTATE.SENT then
+        if old_status ~= BSTATE.SENDING then
+            bucket_reject_update_transition(bid, old_status, new_status)
+        end
+        return
+    end
+    bucket_reject_update(bid, "unknown bucket status: '%s'", new_status)
+end
+
+
+--
+-- Validate whether _bucket update is possible according to the already
+-- existing refs. Prevent data invalidation if request is in progress.
+--
+local function bucket_validate_update_ref(old_bucket, new_bucket)
     local new_status = new_bucket.status
     local bid = new_bucket.id
     local ref = M.bucket_refs[bid]
@@ -390,14 +446,29 @@ local function bucket_prepare_update(old_bucket, new_bucket)
         end
         return
     end
-    bucket_reject_update(bid, "unknown bucket status: '%s'", new_status)
+end
+
+--
+-- Validate whether _bucket update is possible. Bad ones need to be rejected for
+-- the sake of keeping data consistency. Ideally it should never throw. But
+-- there sure are bugs and this trigger should help to catch them from time to
+-- time.
+--
+local function bucket_prepare_update(old_bucket, new_bucket)
+    bucket_validate_update_ref(old_bucket, new_bucket)
+    bucket_validate_update_transition(old_bucket, new_bucket)
 end
 
 local function bucket_prepare_delete(bucket)
     local bid = bucket.id
+    local status = bucket.status
     local ref = M.bucket_refs[bid]
     if ref ~= nil and (ref.ro > 0 or ref.rw > 0) then
         bucket_reject_update(bid, "can't delete a bucket with refs")
+    end
+    if status ~= BSTATE.GARBAGE then
+        bucket_reject_update(bid, "can't delete a bucket with '%s' status",
+                             status)
     end
 end
 
@@ -1486,7 +1557,14 @@ local function bucket_force_create_impl(first_bucket_id, count)
     box.begin()
     local limit = consts.BUCKET_CHUNK_SIZE
     for i = first_bucket_id, first_bucket_id + count - 1 do
-        _bucket:insert({i, consts.BUCKET.ACTIVE})
+        -- Buckets are protected with on_replace trigger, which
+        -- prohibits the creation of the ACTIVE buckets from nowhere,
+        -- as this is done only for bootstrap and not during the normal
+        -- work of vshard. So, as we don't want to disable the protection
+        -- of the buckets for the whole replicaset for bootstrap, a bucket's
+        -- status must go the following way: none -> RECEIVING -> ACTIVE.
+        _bucket:insert({i, consts.BUCKET.RECEIVING})
+        _bucket:replace({i, consts.BUCKET.ACTIVE})
         limit = limit - 1
         if limit == 0 then
             box.commit()

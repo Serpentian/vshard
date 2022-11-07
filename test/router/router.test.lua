@@ -130,7 +130,9 @@ vshard.router.call(1, 'read', 'echo', {123})
 util.check_error(vshard.router.call, 1, 'write', 'echo', {123})
 
 _ = test_run:switch('storage_1_a')
+vshard.storage.internal.is_bucket_protected = false
 box.space._bucket:delete({1})
+vshard.storage.internal.is_bucket_protected = true
 vshard.storage.internal.errinj.ERRINJ_RECOVERY_PAUSE = false
 
 _ = test_run:switch('storage_2_a')

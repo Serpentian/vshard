@@ -46,9 +46,21 @@ vshard.storage.internal.reload_version
 #box.space._bucket:on_replace()
 
 -- Make sure storage operates well.
+test_run:switch('storage_2_b')
+vshard.storage.internal.is_bucket_protected = false
+
+test_run:switch('storage_2_a')
+vshard.storage.internal.is_bucket_protected = false
 vshard.storage.bucket_force_drop(2000)
+vshard.storage.internal.is_bucket_protected = true
 vshard.storage.bucket_force_create(2000)
 vshard.storage.buckets_info()[2000]
+vshard.storage.sync(50)
+
+test_run:switch('storage_2_b')
+vshard.storage.internal.is_bucket_protected = false
+
+test_run:switch('storage_2_a')
 vshard.storage.call(bucket_id_to_move, 'read', 'do_select', {42})
 vshard.storage.bucket_send(bucket_id_to_move, util.replicasets[1])
 wait_bucket_is_collected(bucket_id_to_move)
@@ -69,8 +81,20 @@ vshard.storage.rebalancer_disable()
 move_start = vshard.consts.DEFAULT_BUCKET_COUNT / 2 + 1
 move_cnt = 100
 assert(move_start + move_cnt < vshard.consts.DEFAULT_BUCKET_COUNT)
+
+test_run:switch('storage_2_b')
+vshard.storage.internal.is_bucket_protected = false
+
+test_run:switch('storage_2_a')
+vshard.storage.internal.is_bucket_protected = false
 for i = move_start, move_start + move_cnt - 1 do box.space._bucket:delete{i} end
+vshard.storage.internal.is_bucket_protected = true
 box.space._bucket.index.status:count({vshard.consts.BUCKET.ACTIVE})
+vshard.storage.sync(50)
+
+test_run:switch('storage_2_b')
+vshard.storage.internal.is_bucket_protected = false
+
 test_run:switch('storage_1_a')
 move_start = vshard.consts.DEFAULT_BUCKET_COUNT / 2 + 1
 move_cnt = 100
