@@ -41,7 +41,12 @@ test_group.before_all(function(g)
 end)
 
 test_group.after_all(function(g)
-    g.cluster:drop()
+    -- g.cluster:drop()
+    for _, server in ipairs(g.cluster.servers) do
+        if server then
+            server:stop()
+        end
+    end
 end)
 
 local function bucket_refro(bid)
@@ -436,6 +441,9 @@ test_group.test_bucket_space_reject_bad_replace_on_transition = function(g)
     local rep_b = g.replica_1_b
     rep_b:exec(bucket_set_protection, {false})
     rep_a:exec(function()
+        -- We need to pause garbage collecting as gc isn't supposed
+        -- to delete GARBAGE or replace SENT with GARBAGE bucket.
+        _G.bucket_gc_pause()
         local internal = ivshard.storage.internal
         local _bucket = box.space._bucket
         local bucket_state_edges = internal.bucket_state_edges
@@ -493,6 +501,11 @@ test_group.test_bucket_space_reject_bad_replace_on_transition = function(g)
         internal.is_bucket_protected = true
         -- To be sure that the loops above didn't somehow skip everything.
         ilt.assert_equals(count, 42, 'transition count')
+        _G.bucket_gc_continue()
+        require('log').info('%s', box.info.vclock)
+    end)
+    rep_b:exec(function()
+        require('log').info('%s', box.info.vclock)
     end)
     rep_b:wait_vclock_of(rep_a)
     rep_b:exec(bucket_set_protection, {true})
