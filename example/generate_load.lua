@@ -87,23 +87,38 @@ for _, instance in pairs(instances) do
     instance.conn = nb_connect(instance.uri)
 end
 
--- TODO: make it more general.
-local function vshard_op_func(op, conn)
-    local func_name, request_type, tuple
-    if op == 'replace' then
-        request_type = 'vshard.router.callrw'
-        func_name = 'box.space.customer:replace'
-    elseif op == 'get' then
-        request_type = 'vshard.router.callro'
-        func_name = 'box.space.customer:get'
-    else
+local operations = {
+    ['replace'] = {
+        request_type = 'vshard.router.callrw',
+        func_name = 'box.space.customer:replace',
+        tuple = function(bid) return {bid, bid, 'name'} end,
+        options = {},
+    },
+    ['get'] = {
+        request_type = 'vshard.router.callro',
+        func_name = 'box.space.customer:get',
+        tuple = function(bid) return {bid} end,
+        options = {},
+    },
+    ['select'] = {
+        request_type = 'vshard.router.callro',
+        func_name = 'box.space.customer:select',
+        tuple = function(bid) return {bid} end,
+        options = {iterator = 'GE', limit = 50},
+    },
+}
+
+local function vshard_op_func(op_name, conn)
+    local operation = operations[op_name]
+    if operation == nil then
         error('Unknown operation')
     end
 
     return function(bucket_id)
-        tuple = op == 'replace'
-                and {{bucket_id, bucket_id, 'name'}} or {{bucket_id}}
-        return conn:call(request_type, {bucket_id, func_name, tuple})
+        return conn:call(operation.request_type, {bucket_id,
+            operation.func_name,
+            {operation.tuple(bucket_id), operation.options}
+        })
     end
 end
 
