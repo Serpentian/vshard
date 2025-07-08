@@ -16,7 +16,7 @@ local HELP = [[
    ops <number, 10000000>        - total amount of operations to be performed
    op_type <string, replace>     - which operation is used
    uri <string, localhost:3305>  - uri of the router
-   warmup <number, bucket_count> - percent of ops to skip before measurement
+   warmup <boolean, false>       - whether warmup of the refs is needed
 ]]
 
 local parsed_params = {
@@ -25,7 +25,7 @@ local parsed_params = {
     {'ops', 'number'},
     {'op_type', 'string'},
     {'uri', 'string'},
-    {'warmup', 'number'},
+    {'warmup', 'boolean'},
     {'h', 'boolean'},
     {'help', 'boolean'},
 }
@@ -46,7 +46,18 @@ local fibers_num = params.fibers or 50
 local ops_num = params.ops or 1000000
 local op_type = params.op_type or 'replace'
 local uri = params.uri or 'localhost:3305'
-local warmup = params.warmup or bucket_count
+local warmup = params.warmup or false
+
+--------------------------------------------------------------------------------
+-- Utils
+--------------------------------------------------------------------------------
+
+local function fiber_join(f)
+    local ok, err = f:join()
+    if not ok then
+        log.warn(('Failed to join fiber: %s'):format(err))
+    end
+end
 
 --------------------------------------------------------------------------------
 -- Connect to instances.
@@ -126,10 +137,32 @@ end
 -- Warmup
 --------------------------------------------------------------------------------
 
-for _, instance in pairs(instances) do
-    for bid = 1, warmup do
-        local warmup_func = vshard_op_func('replace', instance.conn)
-        warmup_func(bid)
+local buckets_per_fiber = bucket_count / fibers_num
+
+if warmup == true then
+    local warmup_func = vshard_op_func('replace', instances.router_1.conn)
+
+    local function warmup_f(start)
+        for bid = start + 1, start + buckets_per_fiber do
+            warmup_func(bid)
+        end
+    end
+
+    if buckets_per_fiber < 100 or fibers_num == 1 then
+        -- Small number of buckets, can be done in the main fiber.
+        for bid = 1, bucket_count do
+            warmup_func(bid)
+        end
+    else
+        local fibers = {}
+        for i = 1, fibers_num do
+            local f = fiber.create(warmup_f, (i - 1) * buckets_per_fiber)
+            f:set_joinable(true)
+            fibers[i] = f
+        end
+        for _, f in ipairs(fibers) do
+            fiber_join(f)
+        end
     end
 end
 
@@ -138,7 +171,6 @@ end
 --------------------------------------------------------------------------------
 
 local ops_per_fiber = ops_num / fibers_num
-local buckets_per_fiber = bucket_count / fibers_num
 
 -- Start timer.
 local timer_begin = {
@@ -174,10 +206,7 @@ for i = 1, fibers_num do
 end
 
 for i = 1, fibers_num do
-    local ok, err = fibers_storage[i]:join()
-    if not ok then
-        log.warn(('Failed to join fiber: %s'):format(err))
-    end
+    fiber_join(fibers_storage[i])
 end
 
 --------------------------------------------------------------------------------
