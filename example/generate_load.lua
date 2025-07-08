@@ -150,10 +150,12 @@ if warmup == true then
 
     if buckets_per_fiber < 100 or fibers_num == 1 then
         -- Small number of buckets, can be done in the main fiber.
+        log.info("Warming up with single fiber")
         for bid = 1, bucket_count do
             warmup_func(bid)
         end
     else
+        log.info("Warming up with %d fibers", fibers_num)
         local fibers = {}
         for i = 1, fibers_num do
             local f = fiber.create(warmup_f, (i - 1) * buckets_per_fiber)
@@ -188,7 +190,8 @@ local function fiber_load(instance, start)
         local _, err = op(bid)
         local latency = clock.time() - start_ts
         bid = (bid + 1) % bucket_count
-        if err then
+        -- May be box.NULL.
+        if err ~= nil then
             log.warn(err)
             instance.stats.error_num = instance.stats.error_num + 1
         else
@@ -197,6 +200,7 @@ local function fiber_load(instance, start)
     end
 end
 
+log.info("Performing %d operations", ops_num)
 local fibers_storage = {}
 for i = 1, fibers_num do
     local f = fiber.create(fiber_load, instances.router_1,
