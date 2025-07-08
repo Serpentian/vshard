@@ -151,6 +151,7 @@ local function fiber_load(instance, start)
     local op = vshard_op_func(op_type, c)
     local bid = start
     for _ = 1, ops_per_fiber do
+        if bid == 0 then bid = 1 end
         local start_ts = clock.time()
         local _, err = op(bid)
         local latency = clock.time() - start_ts
@@ -173,7 +174,10 @@ for i = 1, fibers_num do
 end
 
 for i = 1, fibers_num do
-    fibers_storage[i]:join()
+    local ok, err = fibers_storage[i]:join()
+    if not ok then
+        log.warn(('Failed to join fiber: %s'):format(err))
+    end
 end
 
 --------------------------------------------------------------------------------
