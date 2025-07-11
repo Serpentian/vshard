@@ -13,7 +13,7 @@ local HELP = [[
    bucket_count <number, 3000>   - number of buckets in cluster
    fibers <number, 50>           - number of fibers to run simultaneously
    help (same as -h)             - print this message
-   ops <number, 10000000>        - total amount of operations to be performed
+   ops <number, 1000000>         - total amount of operations to be performed
    op_type <string, replace>     - which operation is used
    uri <string, localhost:3305>  - uri of the router
    warmup <boolean, false>       - whether warmup of the refs is needed
