@@ -249,4 +249,6 @@ end
 return {
     remote_new = router_remote_new,
     local_new = router_local_new,
+    -- Utils.
+    fiber_pool_do = fiber_pool_do,
 }
