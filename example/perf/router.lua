@@ -47,7 +47,55 @@ local operations = {
         request_type = 'vshard.router.callro',
         func_name = 'box.space.customer:select',
         tuple = function(bid) return {bid} end,
-        options = {iterator = 'GE', limit = 50},
+        options = {iterator = 'GE', limit = 7},
+    },
+    ['callro_get'] = {
+        request_type = 'vshard_callro',
+        func_name = 'box.space.customer:get',
+        tuple = function(bid) return {bid} end,
+        options = {},
+    },
+    ['callro_select'] = {
+        request_type = 'vshard_callro',
+        func_name = 'box.space.customer:select',
+        tuple = function(bid) return {bid} end,
+        options = {iterator = 'GE', limit = 7},
+    },
+    ['crud_replace'] = {
+        request_type = 'crud_call',
+        func_name = 'box.space.customer:replace',
+        tuple = function(bid) return {bid, bid, 'name'} end,
+        options = {},
+    },
+    ['crud_get'] = {
+        request_type = 'crud_call',
+        func_name = 'box.space.customer:get',
+        tuple = function(bid) return {bid} end,
+        options = {},
+    },
+    ['crud_select'] = {
+        request_type = 'crud_call',
+        func_name = 'box.space.customer:select',
+        tuple = function(bid) return {bid} end,
+        options = {iterator = 'GE', limit = 7},
+    },
+    ['crud_storage_replace'] = {
+        request_type = 'crud_call_storage',
+        func_name = 'box.space.customer:replace',
+        tuple = function(bid) return {bid, bid, 'name'} end,
+        options = {},
+    },
+    ['crud_storage_get'] = {
+        request_type = 'crud_call_storage',
+        func_name = 'box.space.customer:get',
+        tuple = function(bid) return {bid} end,
+        options = {},
+    },
+    ['crud_storage_select'] = {
+        request_type = 'crud_call_storage',
+        func_name = 'box.space.customer:select',
+        tuple = function(bid) return {bid} end,
+        options = {iterator = 'GE', limit = 7},
     },
 }
 
@@ -120,6 +168,7 @@ local function load_router_f(worker_num, args)
         else
             stats.latency_sum = stats.latency_sum + latency
         end
+	-- fiber.sleep(0.005)
     end
 end
 

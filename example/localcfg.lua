@@ -28,4 +28,7 @@ return {
         }, -- replicaset #2
     }, -- sharding
     replication_connect_quorum = 0,
+    bucket_count = 30000,
+    net_msg_max = 7680,
+    readahead = 163200,
 }

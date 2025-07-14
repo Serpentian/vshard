@@ -65,6 +65,7 @@ box.once("testapp:schema:1", function()
     box.schema.role.grant('public', 'execute', 'function', 'raise_luajit_error')
     box.schema.func.create('raise_client_error')
     box.schema.role.grant('public', 'execute', 'function', 'raise_client_error')
+    box.schema.user.grant('storage', 'super', nil, nil, {if_not_exists = true})
 end)
 
 function customer_add(customer)

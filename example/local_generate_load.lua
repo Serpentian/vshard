@@ -2,10 +2,10 @@ local router = require('perf.router')
 local clock = require('clock')
 local log = require('log')
 
-local BUCKET_COUNT = 3000
+local BUCKET_COUNT = 30000
 local OPS_NUM = 1000000
-local OP_TYPE = 'get'
-local FIBERS_NUM = 50
+local OP_TYPE = 'replace'
+local FIBERS_NUM = 100
 local WARMUP = true
 
 local instance = router.local_new({bucket_count = BUCKET_COUNT})

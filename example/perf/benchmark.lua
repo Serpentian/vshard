@@ -54,8 +54,7 @@ local function format_report(bench)
     else
         assert(output_format == 'console', 'unknown output format')
         for _, res in ipairs(results) do
-            report = report .. ('%s %d rps\n'):format(res.name,
-                                                      res.items_per_second)
+            report = report .. ('%d\n'):format(res.items_per_second)
         end
     end
     return report
