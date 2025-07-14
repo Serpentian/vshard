@@ -12,6 +12,12 @@ end
 replicasets = {'cbf06940-0790-498b-948d-042b62cf3d29',
                'ac522f65-aa94-4134-9f64-51ee384f1a54'}
 
+local listen = {
+    ['router_1'] = 3305,
+    ['router_2'] = 3306,
+    ['router_3'] = 3307,
+}
+
 -- Call a configuration provider
 cfg = dofile('localcfg.lua')
 if arg[1] == 'discovery_disable' then
@@ -19,7 +25,7 @@ if arg[1] == 'discovery_disable' then
 end
 
 if not os.getenv('ADMIN') then
-    cfg.listen = 3305
+    cfg.listen = listen[NAME]
 end
 -- Start the database with sharding
 vshard = require('vshard')
