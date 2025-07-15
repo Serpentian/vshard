@@ -1,6 +1,7 @@
 local clock = require('clock')
 local log = require('log')
 local router = require('router')
+local benchmark = require('benchmark')
 
 local USAGELINE = [[
 
@@ -16,6 +17,7 @@ local HELP = [[
    op_type <string, replace>     - which operation is used
    uri <string, localhost:3305>  - uri(s) of the router(s), comma separated
    warmup <boolean, false>       - whether warmup of the refs is needed
+
 ]]
 
 local parsed_params = {
@@ -33,11 +35,8 @@ local parsed_params = {
 -- Parse command line arguments
 --------------------------------------------------------------------------------
 
-local params = require('internal.argparse').parse(arg, parsed_params)
-if params.h or params.help then
-    print(USAGELINE .. HELP)
-    os.exit(0)
-end
+local params = benchmark.argparse(arg, parsed_params, HELP)
+local bench = benchmark.new(params)
 
 -- Default values.
 local bucket_count = params.bucket_count or 3000
@@ -88,9 +87,16 @@ for _, instance in ipairs(instances) do
     latency_sum = latency_sum + (instance.stats.latency_sum / ops_per_router)
 end
 
+local res = bench:add_result('generate_load', {
+    real_time = real_time,
+    cpu_time = cpu_time,
+    items = ops_done,
+})
+
 log.info('# cluster done %d ops in time: %f, cpu: %f',
-         ops_done, real_time, cpu_time)
-log.info('# cluster average speed: %f', ops_done / real_time)
+         ops_done, res.real_time, res.cpu_time)
+log.info('# cluster average speed: %f', res.items_per_second)
 log.info('# average latency: %f', latency_sum / #instances)
+bench:dump_results()
 
 require('os').exit(0)
