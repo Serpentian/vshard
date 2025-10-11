@@ -799,42 +799,6 @@ local function can_retry_after_error(e)
 end
 
 --
--- True if after the given error on call of the given function the connection
--- must go into backoff.
---
-local function can_backoff_after_error(e, func)
-    if not e then
-        return false
-    end
-    if type(e) ~= 'table' and
-       (type(e) ~= 'cdata' or not ffi.istype('struct error', e)) then
-        return false
-    end
-    -- So far it is enabled only for vshard's own functions. Including
-    -- vshard.storage.call(). Otherwise it is not possible to retry safely -
-    -- user's function could have side effects before raising that error.
-    -- For instance, 'access denied' could be raised by user's function
-    -- internally after it already changed some data on the storage.
-    if not func:startswith('vshard.') then
-        return false
-    end
-    -- ClientError is sent for all errors by old Tarantool versions which didn't
-    -- keep error type. New versions preserve the original error type.
-    if e.type == 'ClientError' or e.type == 'AccessDeniedError' then
-        if e.code == box.error.ACCESS_DENIED then
-            return e.message:startswith("Execute access to function 'vshard.")
-        end
-        if e.code == box.error.NO_SUCH_PROC then
-            return e.message:startswith("Procedure 'vshard.")
-        end
-    end
-    if e.type == 'ShardingError' then
-        return e.code == lerror.code.STORAGE_IS_DISABLED
-    end
-    return false
-end
-
---
 -- Template to implement a function able to visit multiple
 -- replicas with certain details. One of applications - a function
 -- making a call on a nearest available replica. It is possible
@@ -965,7 +929,14 @@ local function replicaset_template_multicallro(prefer_replica, balance)
             end
             if not net_status and not storage_status and
                not can_retry_after_error(retval) then
-                if can_backoff_after_error(retval, func) then
+                -- So far it is enabled only for vshard's own functions.
+                -- Including vshard.storage.call(). Otherwise it is not
+                -- possible to retry safely - user's function could have side
+                -- effects before raising that error. For instance, 'access
+                -- denied' could be raised by user's function internally after
+                -- it already changed some data on the storage.
+                if func:startswith('vshard.') and
+                   util.can_backoff_after_error(retval) then
                     if not replica.backoff_ts then
                         log.warn('Replica %s goes into backoff for %s sec '..
                                  'after error %s', replica.id,

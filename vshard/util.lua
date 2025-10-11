@@ -6,6 +6,7 @@ local lversion = require('vshard.version')
 local lmsgpack = require('msgpack')
 local luri = require('uri')
 local ltarantool = require('tarantool')
+local ffi = require('ffi')
 
 --
 -- Drop all functions from the table. See comment
@@ -479,6 +480,34 @@ else
     uri_format = luri.format
 end
 
+--
+-- True if after the given error on call of the given function the connection
+-- must go into backoff.
+--
+local function can_backoff_after_error(e)
+    if not e then
+        return false
+    end
+    if type(e) ~= 'table' and
+       (type(e) ~= 'cdata' or not ffi.istype('struct error', e)) then
+        return false
+    end
+    -- ClientError is sent for all errors by old Tarantool versions which didn't
+    -- keep error type. New versions preserve the original error type.
+    if e.type == 'ClientError' or e.type == 'AccessDeniedError' then
+        if e.code == box.error.ACCESS_DENIED then
+            return e.message:startswith("Execute access to function 'vshard.")
+        end
+        if e.code == box.error.NO_SUCH_PROC then
+            return e.message:startswith("Procedure 'vshard.")
+        end
+    end
+    if e.type == 'ShardingError' then
+        return e.code == lerror.code.STORAGE_IS_DISABLED
+    end
+    return false
+end
+
 return {
     core_version = tnt_version,
     uri_eq = uri_eq,
@@ -504,4 +533,5 @@ return {
     replicaset_uuid = replicaset_uuid,
     uri_format = uri_format,
     module_unload_functions = module_unload_functions,
+    can_backoff_after_error = can_backoff_after_error,
 }
