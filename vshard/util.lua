@@ -485,11 +485,7 @@ end
 -- must go into backoff.
 --
 local function can_backoff_after_error(e)
-    if not e then
-        return false
-    end
-    if type(e) ~= 'table' and
-       (type(e) ~= 'cdata' or not ffi.istype('struct error', e)) then
+    if not lerror.is(e) then
         return false
     end
     -- ClientError is sent for all errors by old Tarantool versions which didn't

@@ -33,3 +33,16 @@ g.test_box_error_prev = function()
     t.assert_equals(e2, ve2)
     t.assert_equals(e3, ve3)
 end
+
+g.test_is_error = function()
+    t.assert_not(verror.is(nil))
+    t.assert_not(verror.is('string'))
+    t.assert_not(verror.is({}))
+
+    local err = box.error.new(box.error.PROC_LUA, 'msg')
+    t.assert(verror.is(err))
+    t.assert(verror.is(verror.box(err)))
+    t.assert(verror.is(verror.make('string')))
+    t.assert(verror.is(verror.vshard(verror.code.STORAGE_IS_REFERENCED)))
+    t.assert(verror.is({type = 'ClientError', code = 1}))
+end

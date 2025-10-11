@@ -333,6 +333,15 @@ local function error_is_timeout(err)
            err.message == 'Timeout exceeded') or err.type == 'TimedOut'
 end
 
+--
+-- Check, whether the specified argument is an error, created either via
+-- tarantool's box.error or via vshard's api.
+--
+local function is_error(err)
+    return ((type(err) == 'cdata' and ffi.istype('struct error', err)) or
+            type(err) == 'table') and err.type and err.code
+end
+
 return {
     code = error_code,
     box = box_error,
@@ -342,4 +351,5 @@ return {
     alert = make_alert,
     timeout = make_timeout,
     is_timeout = error_is_timeout,
+    is = is_error,
 }
