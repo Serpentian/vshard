@@ -3,10 +3,10 @@ local log = require('log')
 local fiber = require('fiber')
 local lerror = require('vshard.error')
 local lversion = require('vshard.version')
+local lratelimit = require('vshard.log_ratelimit')
 local lmsgpack = require('msgpack')
 local luri = require('uri')
 local ltarantool = require('tarantool')
-local ffi = require('ffi')
 
 --
 -- Drop all functions from the table. See comment
@@ -504,6 +504,35 @@ local function can_backoff_after_error(e)
     return false
 end
 
+local function get_entry_signatature_for_service(entry)
+    if not lerror.is(entry) then
+        return
+    end
+    --
+    -- VHANDSHAKE_NOT_COMPLETE and OBJECT_IS_OUTDATED errors are intended for
+    -- users, internal services should not clutter the logs with them, since
+    -- they are expected during work.
+    --
+    if entry.type == 'ShardingError' and
+       (entry.code == lerror.code.VHANDSHAKE_NOT_COMPLETE or
+        entry.code == lerror.code.OBJECT_IS_OUTDATED) then
+        return
+    end
+    --
+    -- The same applies for the `STORAGE_IS_DISABLED`, access errors and
+    -- non-defined vshard functions.
+    --
+    if can_backoff_after_error(entry) then
+        return
+    end
+    return entry.type, entry.code
+end
+
+local function new_ratelimit_for_service(name)
+    return lratelimit.new({name = name,
+        custom_get_entry_signature = get_entry_signatature_for_service})
+end
+
 return {
     core_version = tnt_version,
     uri_eq = uri_eq,
@@ -530,4 +559,5 @@ return {
     uri_format = uri_format,
     module_unload_functions = module_unload_functions,
     can_backoff_after_error = can_backoff_after_error,
+    new_ratelimit_for_service = new_ratelimit_for_service,
 }
