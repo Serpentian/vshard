@@ -180,6 +180,8 @@ if not M then
         collect_bucket_garbage_fiber = nil,
         -- Save statuses and errors for the gc fiber
         gc_service = nil,
+        -- Ratelimit the logs for the gc service.
+        gc_ratelimit = nil,
         -- How many times the GC fiber performed the garbage collection.
         bucket_gc_count = 0,
 
@@ -187,12 +189,16 @@ if not M then
         recovery_fiber = nil,
         -- Save statuses and errors for the recovery fiber
         recovery_service = nil,
+        -- Ratelimit the logs for the recovery service.
+        recovery_ratelimit = nil,
 
         ----------------------- Rebalancer -----------------------
         -- Fiber to rebalance a cluster.
         rebalancer_fiber = nil,
         -- Save statuses and errors for the rebalancer fiber
         rebalancer_service = nil,
+        -- Ratelimit the logs for the rebalancer service.
+        rebalancer_ratelimit = nil,
         -- Fiber which applies routes one by one. Its presence and
         -- active status means that the rebalancing is in progress
         -- now on the current node.
@@ -965,8 +971,10 @@ local function recovery_step_by_type(type)
                     err = 'unknown'
                 end
                 log.info(start_format, type)
-                log.error('Error during recovery of bucket %s on replicaset '..
-                          '%s: %s', bucket_id, peer_id, err)
+                local level = M.recovery_ratelimit:can_log(err) and
+                              'error' or 'verbose'
+                log[level]('Error during recovery of bucket %s on replicaset '..
+                           '%s: %s', bucket_id, peer_id, err)
                 is_step_empty = false
             end
             goto continue
@@ -1028,6 +1036,7 @@ local function recovery_service_f(service)
     -- there was found a bug, and reload fixes it.
     while module_version == M.module_version do
         service:next_iter()
+        M.recovery_ratelimit:flush()
         if M.errinj.ERRINJ_RECOVERY_PAUSE then
             M.errinj.ERRINJ_RECOVERY_PAUSE = 1
             lfiber.testcancel()
@@ -1044,8 +1053,10 @@ local function recovery_service_f(service)
         ok, total, recovered = pcall(recovery_step_by_type, BSENDING)
         if not ok then
             is_all_recovered = false
-            log.error(service:set_status_error(
-                'Error during sending buckets recovery: %s', total))
+            local level = M.recovery_ratelimit:can_log(total) and
+                          'error' or 'verbose'
+            log[level](service:set_status_error(
+                       'Error during sending buckets recovery: %s', total))
         elseif total ~= recovered then
             is_all_recovered = false
         end
@@ -1055,7 +1066,9 @@ local function recovery_service_f(service)
         ok, total, recovered = pcall(recovery_step_by_type, BRECEIVING)
         if not ok then
             is_all_recovered = false
-            log.error(service:set_status_error(
+            local level = M.recovery_ratelimit:can_log(total) and
+                          'error' or 'verbose'
+            log[level](service:set_status_error(
                 'Error during receiving buckets recovery: %s', total))
         elseif total == 0 then
             bucket_receiving_quota_reset()
@@ -1101,9 +1114,11 @@ end
 local function recovery_f()
     local service = lservice_info.new('recovery')
     M.recovery_service = service
+    M.recovery_ratelimit = util.new_ratelimit_for_service('recovery')
     local ok, err = pcall(recovery_service_f, service)
     if M.recovery_service == service then
         M.recovery_service = nil
+        M.recovery_ratelimit = nil
     end
     if not ok then
         error(err)
@@ -2236,6 +2251,7 @@ local function gc_bucket_service_f(service)
     local status, err, is_done
     while M.module_version == module_version do
         service:next_iter()
+        M.gc_ratelimit:flush()
         if M.errinj.ERRINJ_BUCKET_GC_PAUSE then
             M.errinj.ERRINJ_BUCKET_GC_PAUSE = 1
             lfiber.testcancel()
@@ -2253,8 +2269,10 @@ local function gc_bucket_service_f(service)
             end
             if not status then
                 box.rollback()
-                log.error(service:set_status_error(
-                    'Error during garbage collection step: %s', err))
+                local level = M.gc_ratelimit:can_log(err) and
+                              'error' or 'verbose'
+                log[level](service:set_status_error(
+                           'Error during garbage collection step: %s', err))
             elseif is_done then
                 -- Don't use global generation. During the collection it could
                 -- already change. Instead, remember the generation known before
@@ -2322,9 +2340,11 @@ end
 local function gc_bucket_f()
     local service = lservice_info.new('gc')
     M.gc_service = service
+    M.gc_ratelimit = util.new_ratelimit_for_service('gc')
     local ok, err = pcall(gc_bucket_service_f, service)
     if M.gc_service == service then
         M.gc_service = nil
+        M.gc_ratelimit = nil
     end
     if not ok then
         error(err)
@@ -2790,11 +2810,11 @@ local function rebalancer_download_states()
     local total_bucket_locked_count = 0
     local total_bucket_active_count = 0
     for id, replicaset in pairs(M.replicasets) do
-        local state = master_call(
+        local state, err = master_call(
             replicaset, 'vshard.storage.rebalancer_request_state', {},
             {timeout = consts.REBALANCER_GET_STATE_TIMEOUT})
         if state == nil then
-            return
+            return nil, err
         end
         local bucket_count = state.bucket_active_count +
                              state.bucket_pinned_count
@@ -2825,6 +2845,7 @@ local function rebalancer_service_f(service)
     local module_version = M.module_version
     while module_version == M.module_version do
         service:next_iter()
+        M.rebalancer_ratelimit:flush()
         while not M.is_rebalancer_active do
             log.info('Rebalancer is disabled. Sleep')
             M.rebalancer_service:set_activity('disabled')
@@ -2839,10 +2860,12 @@ local function rebalancer_service_f(service)
             return
         end
         if not status or replicasets == nil then
-            if not status then
-                log.error(service:set_status_error(
-                    'Error during downloading rebalancer states: %s',
-                    replicasets))
+            local err = status and total_bucket_active_count or replicasets
+            if err then
+                local level = M.rebalancer_ratelimit:can_log(err) and
+                      'error' or 'verbose'
+                log[level](service:set_status_error(
+                    'Error during downloading rebalancer states: %s', err))
             end
             log.info('Some buckets are not active, retry rebalancing later')
             service:set_activity('idling')
@@ -2909,9 +2932,11 @@ end
 local function rebalancer_f()
     local service = lservice_info.new('rebalancer')
     M.rebalancer_service = service
+    M.rebalancer_ratelimit = util.new_ratelimit_for_service('recovery')
     local ok, err = pcall(rebalancer_service_f, service)
     if M.rebalancer_service == service then
         M.rebalancer_service = nil
+        M.rebalancer_ratelimit = nil
     end
     if not ok then
         error(err)
