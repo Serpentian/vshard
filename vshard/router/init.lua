@@ -82,6 +82,8 @@ local ROUTER_TEMPLATE = {
         discovery_fiber = nil,
         -- Save statuses and errors for the discovery fiber
         discovery_service = nil,
+        -- Ratelimit the logs for the discovery service.
+        discovery_ratelimit = nil,
         -- How discovery works. On - work infinitely. Off - no
         -- discovery.
         discovery_mode = nil,
@@ -277,6 +279,7 @@ local function discovery_service_f(router, service)
     local mode
     while module_version == M.module_version do
         service:next_iter()
+        router.discovery_ratelimit:flush()
         -- Just typical map reduce - send request to each
         -- replicaset in parallel, and collect responses. Many
         -- requests probably will be needed for each replicaset.
@@ -308,9 +311,11 @@ local function discovery_service_f(router, service)
                 replicaset:callro('vshard.storage.buckets_discovery', iter.args,
                                   opts)
             if not future then
-                log.warn(service:set_status_error(
-                        'Error during discovery %s, retry will be done '..
-                        'later: %s', rs_id, err))
+                local level = router.discovery_ratelimit:can_log(err) and
+                              'warn' or 'verbose'
+                log[level](service:set_status_error(
+                           'Error during discovery %s, retry will be done '..
+                           'later: %s', rs_id, err))
                 goto continue
             end
             iter.future = future
@@ -338,9 +343,11 @@ local function discovery_service_f(router, service)
             end
             if not result then
                 future:discard()
-                log.warn(service:set_status_error(
-                        'Error during discovery %s, retry will be done '..
-                        'later: %s', rs_id, err))
+                local level = router.discovery_ratelimit:can_log(err) and
+                              'warn' or 'verbose'
+                log[level](service:set_status_error(
+                          'Error during discovery %s, retry will be done '..
+                          'later: %s', rs_id, err))
                 goto continue
             end
             local replicaset = router.replicasets[rs_id]
@@ -417,9 +424,11 @@ end
 local function discovery_f(router)
     local service = lservice_info.new('discovery')
     router.discovery_service = service
+    router.discovery_ratelimit = util.new_ratelimit_for_service('discovery')
     local ok, err = pcall(discovery_service_f, router, service)
     if router.discovery_service == service then
         router.discovery_service = nil
+        router.discovery_ratelimit = nil
     end
     if not ok then
         error(err)
