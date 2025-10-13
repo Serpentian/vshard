@@ -923,3 +923,32 @@ test_group.test_locate_master_not_hangs_on_futures = function(g)
     g.replica_1_b:thaw()
     vtest.cluster_cfg(g, global_cfg)
 end
+
+--
+-- gh-588: replica call should not spam the same error on every call.
+--
+test_group.test_replica_call_not_spams_same_error = function(g)
+    vtest.storage_stop(g.replica_1_a)
+    -- Discovery is disabled so that it doesn't make any calls and trigger logs.
+    local new_cfg = table.deepcopy(global_cfg)
+    new_cfg.discovery_mode = 'off'
+    local router = vtest.router_new(g, 'router', new_cfg)
+    router:exec(function()
+        ivconst.LOG_RATELIMIT_INTERVAL = 1
+    end)
+
+    local msg = "Exception during calling 'echo'"
+    router:wait_log_exactly_once(msg, {timeout = 0.5, on_yield = function()
+        local _,  rs = next(ivshard.router.internal.static_router.replicasets)
+        rs:callrw('echo', nil, {timeout = 0.05})
+    end})
+
+    t.helpers.retrying({}, function()
+        router:exec(function() _G.failover_wakeup() end)
+        t.assert(router:grep_log("Suppressed .* messages " ..
+                                 "from 'vshard.replica.replica_1_a'"))
+    end)
+
+    vtest.storage_start(g.replica_1_a, global_cfg)
+    vtest.drop_instance(g, router)
+end

@@ -45,6 +45,7 @@
 --                                               fails, after which the node
 --                                               is considered unhealthy>,
 --             failover_interval = <interval in seconds between pings>,
+--             limiter = <log ratelimiter, used in the replica_call>,
 --          }
 --      },
 --      master = <master server from the array above>,
@@ -98,6 +99,7 @@ local ffi = require('ffi')
 local lcfg = require('vshard.cfg')
 local util = require('vshard.util')
 local lservice_info = require('vshard.service_info')
+local lratelimit = require('vshard.log_ratelimit')
 local fiber_clock = fiber.clock
 local fiber_yield = fiber.yield
 local fiber_cond_wait = util.fiber_cond_wait
@@ -697,8 +699,9 @@ local function replica_call(replica, func, args, opts)
            err.type == 'ClientError') then
             err = lerror.from_string(err.message) or err
         end
-        log.error("Exception during calling '%s' on '%s': %s", func, replica,
-                  err)
+        local level = replica.limiter:can_log(err) and 'error' or 'verbose'
+        log[level]("Exception during calling '%s' on '%s': %s", func, replica,
+                   err)
         return false, nil, lerror.make(err)
     else
         replica_on_success_request(replica)
@@ -1611,7 +1614,8 @@ local function buildall(sharding_cfg)
                 failover_sequential_fail_count = sharding_cfg[count_name],
                 failover_interval = sharding_cfg.failover_interval,
                 failover_replica_lag_limit = sharding_cfg[lag_name],
-                health_status = SYELLOW,
+                health_status = SYELLOW, limiter = lratelimit.new{name =
+                'vshard.replica.' .. (replica_name or replica_uuid)},
             }, replica_mt)
             new_replicaset.replicas[replica_id] = new_replica
             if replica.master then
@@ -1688,6 +1692,16 @@ end
 -- Replica failover
 --------------------------------------------------------------------------------
 
+local function replica_service_flush_limiter(replica)
+    --
+    -- Print, how many errors from `replica_call` were suppressed, if needed.
+    -- This cannot be done inside the `replica_call` itself, since it'll have
+    -- to be done on the success path of the call, which will cause performance
+    -- degradation.
+    --
+    replica.limiter:flush()
+end
+
 --
 -- Check, whether the instance has properly working connection to the master.
 -- Returns the status of the replica's replication and the reason, if it's
@@ -1758,6 +1772,7 @@ local function replica_failover_service_step(replica, data)
         until not replica.errinj.ERRINJ_REPLICA_FAILOVER_DELAY
     end
     data.info:next_iter()
+    replica_service_flush_limiter(replica)
     if not replica.conn or replica.down_ts ~= nil then
         -- Nothing to ping. Connection is either dead or missing.
         data.info:set_activity('idling')
@@ -1935,6 +1950,7 @@ local function replica_collect_idle_conns_service_step(replica, data)
         data.info = lservice_info.new('collect_idle_conns')
     end
     data.info:next_iter()
+    replica_service_flush_limiter(replica)
     local c = replica.conn
     local timeout = consts.REPLICA_NOACTIVITY_TIMEOUT
     if c and replica.activity_ts and
