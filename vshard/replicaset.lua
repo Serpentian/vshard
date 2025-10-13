@@ -1692,7 +1692,7 @@ end
 -- Replica failover
 --------------------------------------------------------------------------------
 
-local function replica_service_flush_limiter(replica)
+local function replica_service_flush_limiter(replica, limiter)
     --
     -- Print, how many errors from `replica_call` were suppressed, if needed.
     -- This cannot be done inside the `replica_call` itself, since it'll have
@@ -1700,6 +1700,10 @@ local function replica_service_flush_limiter(replica)
     -- degradation.
     --
     replica.limiter:flush()
+    if limiter then
+        -- Flush the limiter of the service itself.
+        limiter:flush()
+    end
 end
 
 --
@@ -1764,6 +1768,7 @@ local function replica_failover_service_step(replica, data)
     if not data.info then
         -- Service info is recreated on every reload.
         data.info = lservice_info.new('replica_failover')
+        data.limiter = util.new_ratelimit_for_service('replica_discovery')
     end
     if replica.errinj.ERRINJ_REPLICA_FAILOVER_DELAY then
         replica.errinj.ERRINJ_REPLICA_FAILOVER_DELAY = 'in'
@@ -1772,7 +1777,7 @@ local function replica_failover_service_step(replica, data)
         until not replica.errinj.ERRINJ_REPLICA_FAILOVER_DELAY
     end
     data.info:next_iter()
-    replica_service_flush_limiter(replica)
+    replica_service_flush_limiter(replica, data.limiter)
     if not replica.conn or replica.down_ts ~= nil then
         -- Nothing to ping. Connection is either dead or missing.
         data.info:set_activity('idling')
@@ -1783,9 +1788,10 @@ local function replica_failover_service_step(replica, data)
     data.info:set_activity('pinging')
     local net_status, _, err = replica_failover_ping(replica, opts)
     if not net_status then
-        log.error(data.info:set_status_error(
-            'Ping error from %s: perhaps a connection is down: %s',
-            replica, err))
+        local level = data.limiter:can_log(err) and 'error' or 'verbose'
+        log[level](data.info:set_status_error(
+                   'Ping error from %s: perhaps a connection is down: %s',
+                   replica, err))
         -- Connection hangs. Recreate it to be able to
         -- fail over to a replica next by priority. The
         -- old connection is not closed in case if it just
@@ -1899,6 +1905,7 @@ local function replicaset_failover_service_step(replicaset, data)
     if not data.info then
         -- Service info is recreated on every reload.
         data.info = lservice_info.new('replicaset_failover')
+        data.limiter = util.new_ratelimit_for_service('replicaset_failover')
         -- This flag is used to avoid logging like:
         -- 'All is ok ... All is ok ... All is ok ...'
         -- each replicaset.failover_interval seconds.
@@ -1913,11 +1920,14 @@ local function replicaset_failover_service_step(replicaset, data)
     end
     data.info:next_iter()
     data.info:set_activity('updating replicas')
+    data.limiter:flush()
     local ok, replica_is_changed = pcall(replicaset_failover_step, replicaset)
     if not ok then
-        log.error(data.info:set_status_error(
-            'Error during failovering: %s',
-            lerror.make(replica_is_changed)))
+        local level = data.limiter:can_log(replica_is_changed)
+                      and 'error' or 'verbose'
+        log[level](data.info:set_status_error(
+                   'Error during failovering: %s',
+                   lerror.make(replica_is_changed)))
         replica_is_changed = true
     else
         data.info:set_status_ok()
@@ -2002,10 +2012,12 @@ end
 local function replicaset_master_search_service_step(replicaset, data)
     if not data.info then
         data.info = lservice_info.new('master_search')
+        data.limiter = util.new_ratelimit_for_service('master_search')
         data.is_in_progress = false
     end
     data.info:next_iter()
     data.info:set_activity('locating master')
+    data.limiter:flush()
     if replicaset.errinj.ERRINJ_MASTER_SEARCH_DELAY then
         replicaset.errinj.ERRINJ_MASTER_SEARCH_DELAY = 'in'
         repeat
@@ -2018,8 +2030,9 @@ local function replicaset_master_search_service_step(replicaset, data)
     local is_done, is_nop, err =
         replicaset_master_search_step(replicaset, {mode = mode})
     if err then
-        log.error(data.info:set_status_error(
-            'Error during master search: %s', lerror.make(err)))
+        local level = data.limiter:can_log(err) and 'error' or 'verbose'
+        log[level](data.info:set_status_error(
+                   'Error during master search: %s', lerror.make(err)))
     end
     if is_done then
         timeout = consts.MASTER_SEARCH_IDLE_INTERVAL
