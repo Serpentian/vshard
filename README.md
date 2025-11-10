@@ -4,6 +4,8 @@
 
 Sharding module for **Tarantool** based on Virtual Buckets concept.
 
+
+
 ![alt text](https://github.com/tarantool/vshard/blob/master/sharding_arch.png)
 
 ## Prerequisites
