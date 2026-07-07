@@ -11,9 +11,9 @@ start:
 	tarantoolctl start router_4
 	tarantoolctl start router_5
 	tarantoolctl start router_6
-	tarantoolctl start router_7
-	tarantoolctl start router_8
-	tarantoolctl start router_9
+	#tarantoolctl start router_7
+	#tarantoolctl start router_8
+	#tarantoolctl start router_9
 	@echo "Waiting cluster to start"
 	@sleep 1
 	echo "vshard.router.bootstrap({timeout = 30})" | tarantoolctl enter router_1
@@ -29,9 +29,9 @@ stop:
 	tarantoolctl stop router_4
 	tarantoolctl stop router_5
 	tarantoolctl stop router_6
-	tarantoolctl stop router_7
-	tarantoolctl stop router_8
-	tarantoolctl stop router_9
+	# tarantoolctl stop router_7
+	# tarantoolctl stop router_8
+	# tarantoolctl stop router_9
 
 enter:
 	tarantoolctl enter router_1

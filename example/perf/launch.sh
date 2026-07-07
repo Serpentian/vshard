@@ -1,6 +1,6 @@
 #!/bin/sh
 
-ITERATIONS=20
+ITERATIONS=3
 WORKERS=3
 
 # Parse options
@@ -19,9 +19,9 @@ for ((i=1; i<=ITERATIONS; i++)); do
     for ((w=1; w<=WORKERS; w++)); do
         tarantool generate_load.lua \
             --bucket_count 30000 \
-            --op_type callro_select \
+            --op_type replace \
             --warmup \
-            --uri localhost:3305,localhost:3306,localhost:3307,localhost:3308,localhost:3309,localhost:3310,localhost:3311,localhost:3312,localhost:3313 \
+            --uri localhost:3305,localhost:3306,localhost:3307,localhost:3308,localhost:3309,localhost:3310 \
             --fibers 50 \
             --ops 1000000 \
             --output load${w}.txt &

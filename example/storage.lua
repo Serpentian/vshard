@@ -126,3 +126,7 @@ end
 function raise_client_error()
     box.error(box.error.UNKNOWN)
 end
+
+function customer_replace(tuple)
+    box.space.customer:replace(tuple)
+end

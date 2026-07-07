@@ -62,6 +62,10 @@ if not M then
             bool rw_lock;
             bool ro_lock;
         };
+
+        struct vshard_call_gate {
+            bool is_fast;
+        };
     ]]
     bucket_ref_new = ffi.metatype("struct bucket_ref", {})
     --
@@ -256,6 +260,10 @@ if not M then
         -- Condition variable fired each time a bucket locked for
         -- RW refs reaches 0 of the latter.
         bucket_rw_lock_is_ready_cond = lfiber.cond(),
+        -- Flag shared with the C implementation of vshard.storage.call
+        -- telling whether the fast path can be taken. Must be equal to
+        -- (api_call_cache == storage_api_call_safe).
+        c_call_gate = ffi.new('struct vshard_call_gate'),
 
         ------------------------- Reload -------------------------
         -- Version of the loaded module. This number is used on
@@ -286,6 +294,16 @@ else
     end
     if M.is_master_cond == nil then
         M.is_master_cond = lfiber.cond()
+    end
+    if M.c_call_gate == nil then
+        -- Reload from a version which didn't declare the type in this
+        -- process yet.
+        ffi.cdef[[
+            struct vshard_call_gate {
+                bool is_fast;
+            };
+        ]]
+        M.c_call_gate = ffi.new('struct vshard_call_gate')
     end
 end
 
@@ -3494,6 +3512,37 @@ local function storage_call(bucket_id, mode, name, args)
     return ok, ret1, ret2, ret3
 end
 
+-- Everything related to the C implementation of vshard.storage.call. Kept
+-- in one table to avoid another handful of chunk-level locals - LuaJIT
+-- allows at most 200 per function.
+local c_call = {is_absence_logged = false}
+
+--
+-- Helper for the C implementation of vshard.storage.call covering the case
+-- when the user's function has failed. It can't be handled by re-running the
+-- whole call in Lua - the function was already executed. Repeats what
+-- storage_call() would do: net_box.self.call() rolls a failed transaction
+-- back and wraps the error into PROC_LUA (see handle_eval_result() in the
+-- core's net_box.lua), then the error is passed through lerror.make() and
+-- the bucket is unreferenced with the err.prev chaining on a half-deleted
+-- bucket.
+--
+-- Returns the final reply pair of storage_call().
+--
+function c_call.finish_error(bucket_id, mode, err)
+    box.rollback()
+    -- The raw error value goes into the PROC_LUA payload as is - exactly
+    -- like in net_box's handle_eval_result().
+    err = lerror.make(box.error.new(box.error.PROC_LUA, err))
+    local ok_ref, unref_err = bucket_unref(bucket_id, mode)
+    if not ok_ref then
+        -- See the same-purpose assignment in storage_call().
+        unref_err.prev = err
+        return nil, unref_err
+    end
+    return false, err
+end
+
 --
 -- Bind a new storage ref to the current box session. Is used as a part of
 -- Map-Reduce API.
@@ -4252,6 +4301,9 @@ local function storage_cfg(cfg, this_replica_id, is_reload)
     if not ok then
         error(err)
     end
+    -- c_call.install is defined below - it needs the public API wrappers
+    -- which are built after the config machinery.
+    c_call.install()
 end
 
 --------------------------------------------------------------------------------
@@ -4485,6 +4537,7 @@ local function storage_api_call_unsafe(func, opts, ...)
         return error(lerror.vshard(lerror.code.STORAGE_IS_DISABLED, msg))
     end
     M.api_call_cache = storage_api_call_safe
+    M.c_call_gate.is_fast = true
     return func(...)
 end
 
@@ -4506,6 +4559,68 @@ end
 local function storage_disable()
     M.is_enabled = false
     M.api_call_cache = storage_api_call_unsafe
+    M.c_call_gate.is_fast = false
+end
+
+--------------------------------------------------------------------------------
+-- C acceleration of vshard.storage.call
+--------------------------------------------------------------------------------
+
+-- The same closure both is returned from the module as `call` and serves as
+-- the universal fallback of the C implementation.
+c_call.api = storage_make_api(storage_call)
+
+--
+-- Register the C implementation of vshard.storage.call in the core's
+-- function registry (box.iproto.export). The core looks the registry up on
+-- IPROTO_CALL before walking _G, so the function serves the existing
+-- body-less 'vshard.storage.call' from _func - the grants and setuid stay
+-- intact and the routers don't notice any difference except the speed.
+--
+-- Not having the acceleration is always fine: a too old core, a pure-Lua
+-- installation without the .so, or VSHARD_NO_C_CALL in the environment
+-- simply leave the Lua implementation serve the calls.
+--
+function c_call.install()
+    if not util.feature.iproto_func_registry or
+       os.getenv('VSHARD_NO_C_CALL') then
+        return
+    end
+    local ok, cmod = pcall(require, 'vshard.storage.call_c')
+    if not ok then
+        if not c_call.is_absence_logged then
+            log.info('C acceleration of vshard.storage.call is not '..
+                     'available: %s', cmod)
+            c_call.is_absence_logged = true
+        end
+        return
+    end
+    local err
+    ok, err = pcall(function()
+        cmod.setup({
+            m = M,
+            gate = M.c_call_gate,
+            call_fallback = c_call.api,
+            finish_error = c_call.finish_error,
+            finish_unref = bucket_unref,
+            recovery_check = box.ctl.is_recovery_finished,
+            -- box.NULL == nil, but the C API of LuaJIT can't see that.
+            is_nil = function(value) return value == nil end,
+        })
+        local name = 'vshard.storage.call'
+        local registered = box.internal.func_registry[name]
+        if registered == nil then
+            box.iproto.export(name, cmod.call)
+        elseif registered ~= cmod.call then
+            log.warn('Function registry already has an entry for %s not '..
+                     'belonging to vshard - the C acceleration is not '..
+                     'activated', name)
+        end
+    end)
+    if not ok then
+        log.error('Failed to install the C acceleration of '..
+                  'vshard.storage.call: %s', err)
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -4601,6 +4716,7 @@ M.instance_watch_f = instance_watch_f
 M.master_sync_f = master_sync_f
 
 M.api_call_cache = storage_api_call_unsafe
+M.c_call_gate.is_fast = false
 
 --
 -- These functions are saved in M not for atomic reload, but for
@@ -4674,7 +4790,7 @@ return {
     -- Miscellaneous.
     --
     master_sync_wakeup = storage_make_api(master_sync_wakeup),
-    call = storage_make_api(storage_call),
+    call = c_call.api,
     _call = storage_make_api(service_call),
     sync = storage_make_api(sync),
     cfg = function(cfg, id) return storage_cfg(cfg, id, false) end,

@@ -465,6 +465,14 @@ local feature = {
         return ok and res.replicaset ~= nil
     end)(),
     persistent_names = version_is_at_least(3, 0, 0, 'entrypoint', 0, 0),
+    -- box.iproto.export() puts a function into box.internal.func_registry,
+    -- which is checked by the core on IPROTO_CALL before _G. It allows to
+    -- serve a persistent function name with an in-memory Lua/C callable.
+    -- Appeared in 3.7.0. Detected by presence - a version check would
+    -- misjudge the intermediate entrypoint builds.
+    iproto_func_registry = box.iproto ~= nil and
+        type(box.iproto.export) == 'function' and
+        box.internal ~= nil and box.internal.func_registry ~= nil,
 }
 
 local schema_version = function()

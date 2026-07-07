@@ -33,7 +33,7 @@ local log = require('log')
 local operations = {
     ['replace'] = {
         request_type = 'vshard.router.callrw',
-        func_name = 'box.space.customer:replace',
+        func_name = 'customer_replace',
         tuple = function(bid) return {bid, bid, 'name'} end,
         options = {},
     },
