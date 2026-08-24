@@ -70,7 +70,11 @@ local function exports_deploy_funcs(exports)
         end
         local func_export = exports.funcs[name]
         if not func_export then
-            table.insert(to_drop_funcs, name)
+            -- The C storage prototype (VSHARD_C_CALL) manages its
+            -- functions outside of the export log.
+            if not name:startswith('vshard.storage_c.') then
+                table.insert(to_drop_funcs, name)
+            end
         else
             existing_funcs[name] = true
             local current_def = {

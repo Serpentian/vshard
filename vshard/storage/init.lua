@@ -22,7 +22,7 @@ if rawget(_G, MODULE_INTERNALS) then
         'vshard.heap', 'vshard.storage.ref', 'vshard.storage.sched',
         'vshard.storage.schema', 'vshard.storage.export_log',
         'vshard.storage.exports', 'vshard.log_ratelimit',
-        'vshard.storage.route_dispenser',
+        'vshard.storage.route_dispenser', 'vshard.storage.c_api',
     }
     for _, module in pairs(vshard_modules) do
         package.loaded[module] = nil
@@ -39,6 +39,7 @@ local lratelimit = require('vshard.log_ratelimit')
 local lref = require('vshard.storage.ref')
 local lsched = require('vshard.storage.sched')
 local lschema = require('vshard.storage.schema')
+local lcapi = require('vshard.storage.c_api')
 local reload_evolution = require('vshard.storage.reload_evolution')
 local route_dispenser = require('vshard.storage.route_dispenser')
 local fiber_cond_wait = util.fiber_cond_wait
@@ -285,6 +286,92 @@ else
     if M.is_master_cond == nil then
         M.is_master_cond = lfiber.cond()
     end
+    if M.is_storage_c_enabled == nil then
+        M.is_storage_c_enabled = false
+    end
+end
+
+-- C storage implementation namespace (VSHARD_C_CALL prototype).
+-- One table to spare main-chunk local slots; the functions are
+-- defined further below.
+local storage_c = {}
+
+--
+-- When the C storage implementation is enabled, the refs live in
+-- the C module's memory - one source of truth shared by the Lua
+-- and C call implementations. M.bucket_refs then becomes this
+-- view: raw entries mirror the refs created through Lua (so that
+-- tests and debug tooling reading or writing the table keep
+-- working), __index falls back to the C state, __newindex
+-- writes through into it.
+--
+function storage_c.make_refs_view()
+    -- The raw table stays empty so that both metamethods always
+    -- fire. Iteration over the view is not supported.
+    return setmetatable({}, {
+        __index = function(_, bid)
+            if type(bid) ~= 'number' then
+                return nil
+            end
+            return lcapi.ref_get(bid)
+        end,
+        __newindex = function(_, bid, v)
+            if v == nil then
+                lcapi.ref_del(bid)
+                return
+            end
+            local ref = lcapi.ref_new(bid)
+            ref.ro = v.ro
+            ref.rw = v.rw
+            ref.ro_lock = v.ro_lock
+            ref.rw_lock = v.rw_lock
+        end,
+    })
+end
+
+--
+-- Accessors for the bucket ref counters, dispatching between
+-- M.bucket_refs (pure Lua mode) and the C-owned ref array.
+--
+local brefs = {}
+
+function brefs.get(bid)
+    if M.is_storage_c_enabled then
+        return lcapi.ref_get(bid)
+    end
+    return M.bucket_refs[bid]
+end
+
+function brefs.new(bid)
+    if M.is_storage_c_enabled then
+        return lcapi.ref_new(bid)
+    end
+    local ref = bucket_ref_new()
+    M.bucket_refs[bid] = ref
+    return ref
+end
+
+function brefs.del(bid)
+    if M.is_storage_c_enabled then
+        return lcapi.ref_del(bid)
+    end
+    M.bucket_refs[bid] = nil
+end
+
+function brefs.clear()
+    if M.is_storage_c_enabled then
+        lcapi.refs_clear()
+        -- Replace the view like the Lua mode replaces the table
+        -- and mark the old one, so that code comparing the old
+        -- and the new M.bucket_refs sees them as different.
+        local old = M.bucket_refs
+        M.bucket_refs = storage_c.make_refs_view()
+        if getmetatable(old) ~= nil then
+            rawset(old, 'is_outdated', true)
+        end
+        return
+    end
+    M.bucket_refs = {}
 end
 
 --
@@ -503,7 +590,7 @@ end
 local function bucket_commit_update(bucket)
     local status = bucket.status
     local bid = bucket.id
-    local ref = M.bucket_refs[bid]
+    local ref = brefs.get(bid)
     if ref == nil then
         -- Ref doesn't exist, nothing to do.
         return
@@ -513,7 +600,7 @@ local function bucket_commit_update(bucket)
         -- It shouldn't have a ref, but prepare to anything. Could be, for
         -- example, ACTIVE changed into RECEIVING manually via
         -- _bucket:replace().
-        M.bucket_refs[bid] = nil
+        brefs.del(bid)
         return
     end
 
@@ -522,7 +609,7 @@ local function bucket_commit_update(bucket)
 end
 
 local function bucket_commit_delete(bucket)
-    M.bucket_refs[bucket.id] = nil
+    brefs.del(bucket.id)
 end
 
 local bucket_state_edges = {
@@ -562,7 +649,7 @@ local function bucket_prepare_update(old_bucket, new_bucket)
     local new_status = new_bucket.status
     local old_status = old_bucket ~= nil and old_bucket.status or box.NULL
     local bid = new_bucket.id
-    local ref = M.bucket_refs[bid]
+    local ref = brefs.get(bid)
     -- Check if existing refs allow the bucket to transfer to a new status.
     if old_bucket == nil and ref ~= nil then
         bucket_reject_update(bid, "new bucket can't have a ref object")
@@ -632,7 +719,7 @@ end
 local function bucket_prepare_delete(bucket)
     local bid = bucket.id
     local status = bucket.status
-    local ref = M.bucket_refs[bid]
+    local ref = brefs.get(bid)
     if ref ~= nil and (ref.ro > 0 or ref.rw > 0) then
         bucket_reject_update(bid, "can't delete a bucket with refs")
     end
@@ -715,7 +802,7 @@ local function bucket_on_truncate_commit_f(row_pairs)
     for _, _, new, space_id in row_pairs() do
         if space_id == truncate_space_id and new ~= nil and
            new[1] == bucket_space_id then
-            M.bucket_refs = {}
+            brefs.clear()
             bucket_generation_increment()
         end
     end
@@ -920,6 +1007,175 @@ local function check_is_master()
     end
     return nil, lerror.vshard(lerror.code.NON_MASTER, M.this_replica.id,
                               M.this_replicaset.id, master_id)
+end
+
+--------------------------------------------------------------------------------
+-- C storage implementation (prototype)
+--------------------------------------------------------------------------------
+
+function storage_c.is_requested()
+    local v = os.getenv('VSHARD_C_CALL')
+    return v ~= nil and v ~= '' and v ~= '0'
+end
+
+--
+-- Events fired by the C module on cold unref paths. Must not
+-- yield - they are called from a persistent C-owned coroutine.
+--
+function storage_c.on_event(ev)
+    if ev == 1 then
+        bucket_generation_increment()
+    elseif ev == 2 then
+        M.bucket_rw_lock_is_ready_cond:broadcast()
+    end
+end
+
+local function storage_c_nvl(v)
+    if v == nil then
+        return lmsgpack.NULL
+    end
+    return v
+end
+
+--
+-- Encode a storage_call()-style multireturn as one msgpack
+-- array. storage_call() already truncates trailing nils, so only
+-- the middle ones need boxing.
+--
+function storage_c.encode_reply(ok, ret1, ret2, ret3)
+    if ret3 ~= nil then
+        return lmsgpack.encode({storage_c_nvl(ok), storage_c_nvl(ret1),
+                                storage_c_nvl(ret2), ret3})
+    end
+    if ret2 ~= nil then
+        return lmsgpack.encode({storage_c_nvl(ok), storage_c_nvl(ret1), ret2})
+    end
+    if ret1 ~= nil then
+        return lmsgpack.encode({storage_c_nvl(ok), ret1})
+    end
+    return lmsgpack.encode({ok})
+end
+
+--
+-- The helpers the C call implementation delegates to whenever
+-- anything goes off the fast path. full_call is defined next to
+-- storage_call() below - it needs it as an upvalue.
+--
+storage_c.helpers = {}
+
+--
+-- Used when a registered function ran and FAILED - it must not
+-- be re-executed, so only the error encoding is delegated. The
+-- rollback mirrors handle_results(): reveal the original error
+-- instead of 'Transaction is active'.
+--
+function storage_c.helpers.encode_error()
+    local err = lerror.make(box.error.last())
+    box.rollback()
+    return lmsgpack.encode({false, err})
+end
+
+--
+-- Push the is-master flag and ids into the C module. Must be
+-- called on every master switch - the C refrw path checks it on
+-- each request.
+--
+function storage_c.identity_update()
+    if not M.is_storage_c_enabled then
+        return
+    end
+    local rs = M.this_replicaset
+    lcapi.set_identity(M.this_replica and M.this_replica.id or nil,
+                       rs and rs.id or nil,
+                       rs and rs.master and rs.master.id or nil,
+                       M.is_master)
+end
+
+storage_c.funcs = {
+    'vshard.storage_c.setup',
+    'vshard.storage_c.call',
+}
+
+function storage_c.setup()
+    local rs = M.this_replicaset
+    local ok, err = lcapi.setup({
+        bucket_count = M.total_bucket_count,
+        replica_id = M.this_replica.id,
+        replicaset_id = rs.id,
+        master_id = rs.master and rs.master.id,
+        is_master = M.is_master,
+        on_event = storage_c.on_event,
+        helpers = storage_c.helpers,
+    })
+    if not ok then
+        log.warn('vshard.storage_c: setup failed - %s. The C call path is '..
+                 'disabled', err)
+        return
+    end
+    M.is_storage_c_enabled = true
+    M.bucket_refs = storage_c.make_refs_view()
+    log.info('vshard.storage_c: the C storage.call implementation is enabled')
+end
+
+--
+-- Prototype-grade registration: no export_log versioning. The
+-- _func entries are created on a writable master and replicated.
+-- Returns true when the C call path became enabled.
+--
+function storage_c.try_enable()
+    local is_registered = box.func ~= nil and
+                          box.func['vshard.storage_c.setup'] ~= nil
+    if not is_registered and this_is_master() and not box.info.ro then
+        for _, name in ipairs(storage_c.funcs) do
+            box.schema.func.create(name, {language = 'C', setuid = true,
+                                          if_not_exists = true})
+        end
+        local user = luri.parse(M.this_replica.uri).login
+        if user ~= nil then
+            for _, name in ipairs(storage_c.funcs) do
+                box.schema.user.grant(user, 'execute', 'function', name,
+                                      {if_not_exists = true})
+            end
+        end
+        is_registered = true
+    end
+    if not is_registered or box.space._bucket == nil then
+        return false
+    end
+    storage_c.setup()
+    return M.is_storage_c_enabled
+end
+
+--
+-- Enable the C call path. Never fails: when the instance can not
+-- do it right now (still read-only after promotion, the _func
+-- entries are not replicated yet, no _bucket), a background
+-- fiber keeps retrying.
+--
+function storage_c.enable()
+    local ok, res = pcall(storage_c.try_enable)
+    if ok and res then
+        return
+    end
+    if storage_c.retry_fiber ~= nil and
+       storage_c.retry_fiber:status() ~= 'dead' then
+        return
+    end
+    storage_c.retry_fiber = lfiber.new(function()
+        lfiber.name('vshard.storage_c_enable', {truncate = true})
+        for _ = 1, 120 do
+            lfiber.sleep(1)
+            if M.is_storage_c_enabled then
+                return
+            end
+            local f_ok, f_res = pcall(storage_c.try_enable)
+            if f_ok and f_res then
+                storage_c.identity_update()
+                return
+            end
+        end
+        log.warn('vshard.storage_c: gave up enabling the C call path')
+    end)
 end
 
 local function on_master_disable(new_func, old_func)
@@ -1470,16 +1726,15 @@ end
 --         returned via the second value.
 --
 local function bucket_refro(bucket_id)
-    local ref = M.bucket_refs[bucket_id]
+    local ref = brefs.get(bucket_id)
     if not ref then
         local bucket, err = bucket_check_state(bucket_id, 'read')
         if err then
             return nil, err
         end
-        ref = bucket_ref_new()
+        ref = brefs.new(bucket_id)
         ref.ro = 1
         ref.rw_lock = not util.bucket_status_is_writable(bucket.status)
-        M.bucket_refs[bucket_id] = ref
     elseif ref.ro_lock then
         return nil, lerror.vshard(lerror.code.BUCKET_IS_LOCKED, bucket_id)
     else
@@ -1492,7 +1747,7 @@ end
 -- Remove one RO reference.
 --
 local function bucket_unrefro(bucket_id)
-    local ref = M.bucket_refs[bucket_id]
+    local ref = brefs.get(bucket_id)
     local count = ref and ref.ro or 0
     if count == 0 then
         return nil, lerror.vshard(lerror.code.BUCKET_IS_CORRUPTED, bucket_id,
@@ -1521,15 +1776,14 @@ end
 -- transfer.
 --
 local function bucket_refrw(bucket_id)
-    local ref = M.bucket_refs[bucket_id]
+    local ref = brefs.get(bucket_id)
     if not ref then
         local _, err = bucket_check_state(bucket_id, 'write')
         if err then
             return nil, err
         end
-        ref = bucket_ref_new()
+        ref = brefs.new(bucket_id)
         ref.rw = 1
-        M.bucket_refs[bucket_id] = ref
     elseif ref.rw_lock then
         return nil, lerror.vshard(lerror.code.BUCKET_IS_LOCKED, bucket_id)
     else
@@ -1546,7 +1800,7 @@ end
 -- Remove one RW reference.
 --
 local function bucket_unrefrw(bucket_id)
-    local ref = M.bucket_refs[bucket_id]
+    local ref = brefs.get(bucket_id)
     if not ref or ref.rw == 0 then
         return nil, lerror.vshard(lerror.code.BUCKET_IS_CORRUPTED, bucket_id,
                                   "no rw refs on unref")
@@ -1582,6 +1836,25 @@ local function bucket_unref(bucket_id, mode)
     else
         error('Unknown mode')
     end
+end
+
+--
+-- Used by the C call implementation when its unref failed after
+-- the call. Rerun the unref in Lua to regenerate the exact error
+-- - the failed C unref did not change anything. Mirrors the
+-- storage_call() tail: the unref error wins, the call error goes
+-- to 'prev'.
+--
+function storage_c.helpers.encode_unref_error(bucket_id, mode, call_err_mp)
+    local _, err = bucket_unref(bucket_id, mode)
+    if err == nil then
+        err = lerror.vshard(lerror.code.BUCKET_IS_CORRUPTED, bucket_id,
+                            'no refs on unref')
+    end
+    if call_err_mp ~= nil then
+        err.prev = lmsgpack.decode(call_err_mp)
+    end
+    return lmsgpack.encode({lmsgpack.NULL, err})
 end
 
 --
@@ -1857,7 +2130,6 @@ end
 -- Test which of the passed bucket IDs can be safely garbage collected.
 --
 local function bucket_test_gc(bids)
-    local refs = M.bucket_refs
     local bids_not_ok = table.new(consts.BUCKET_CHUNK_SIZE, 0)
     -- +1 because the expected max count is exactly the chunk size. No need to
     -- yield on the last one. But if somewhy more is received, then do the
@@ -1874,7 +2146,7 @@ local function bucket_test_gc(bids)
         if status ~= BGARBAGE and status ~= BSENT then
             goto not_ok_bid
         end
-        ref = refs[bid]
+        ref = brefs.get(bid)
         if ref == nil then
             goto next_bid
         end
@@ -1910,7 +2182,7 @@ local function bucket_test_send(bids, opts)
             error(lerror.vshard(lerror.code.WRONG_BUCKET, bid, reason,
                                 M.this_replica.id))
         end
-        local ref = M.bucket_refs[bid]
+        local ref = brefs.get(bid)
         while ref and ref.rw ~= 0 do
             timeout = deadline - fiber_clock()
             ok, err = fiber_cond_wait(M.bucket_rw_lock_is_ready_cond, timeout)
@@ -1921,7 +2193,7 @@ local function bucket_test_send(bids, opts)
                 final_err.prev = err
                 error(final_err)
             end
-            ref = M.bucket_refs[bid]
+            ref = brefs.get(bid)
         end
     end
 end
@@ -2088,7 +2360,7 @@ local function bucket_send_prepare(bid, opts)
     if not ok then
         goto error
     end
-    ref = M.bucket_refs[bid]
+    ref = brefs.get(bid)
     while ref and ref.rw ~= 0 do
         timeout = deadline - fiber_clock()
         ok, err = fiber_cond_wait(M.bucket_rw_lock_is_ready_cond, timeout)
@@ -2096,7 +2368,7 @@ local function bucket_send_prepare(bid, opts)
             goto error
         end
         lfiber.testcancel()
-        ref = M.bucket_refs[bid]
+        ref = brefs.get(bid)
         if not ref then
             -- The ref was dropped, even though it was here. Probably the
             -- bucket was manually dropped, while we were waiting, or the ref
@@ -2121,7 +2393,7 @@ local function bucket_send_xc(bucket_id, destination, opts)
     assert(opts and opts.chunk_timeout and opts.deadline)
     -- `bucket_send_prepare()` must be called before `bucket_send_xc()`.
     assert(M.rebalancer_transfering_buckets[bucket_id])
-    local ref = M.bucket_refs[bucket_id]
+    local ref = brefs.get(bucket_id)
     assert(not ref or (ref.rw == 0 and ref.rw_lock))
     assert(lref.count == 0)
     local id = M.this_replicaset.id
@@ -2402,7 +2674,7 @@ local function gc_bucket_drop_xc(status, route_map)
     local sharded_spaces = lschema.find_sharded_spaces()
     for _, b in _bucket.index.status:pairs(status) do
         local id = b.id
-        local ref = M.bucket_refs[id]
+        local ref = brefs.get(id)
         if ref then
             assert(ref.rw == 0)
             if ref.ro ~= 0 then
@@ -2492,7 +2764,7 @@ local function gc_bucket_process_sent_one_batch_xc(batch)
     local _bucket = box.space._bucket
     for bid, _ in pairs(bids_ok_map) do
         local bucket = _bucket:get(bid)
-        local ref = M.bucket_refs[bid]
+        local ref = brefs.get(bid)
         if bucket == nil or bucket.status ~= BSENT or
            ref ~= nil and ref.ro ~= 0 then
             box.rollback()
@@ -2529,7 +2801,7 @@ local function gc_bucket_process_sent_xc()
         if M.rebalancer_transfering_buckets[bid] then
             goto continue
         end
-        ref = M.bucket_refs[bid]
+        ref = brefs.get(bid)
         if ref ~= nil then
             assert(ref.rw == 0)
             if ref.ro ~= 0 then
@@ -2862,7 +3134,7 @@ local function rebalancer_prepare_buckets(bucket_count, opts)
         -- Prefer buckets without rw refs or without refs at all.
         for _, bucket in _status:pairs(active_key) do
             bucket_id = bucket.id
-            local ref = M.bucket_refs[bucket_id]
+            local ref = brefs.get(bucket_id)
             if not M.rebalancer_transfering_buckets[bucket_id] and
                (not ref or ref.rw == 0) then
                 goto prepare
@@ -3500,6 +3772,20 @@ local function storage_call(bucket_id, mode, name, args)
 end
 
 --
+-- Used by the C call implementation whenever a request goes off
+-- its fast path: malformed args, a failed bucket ref, a function
+-- not registered in _func. The whole request is re-executed
+-- through storage_call(), so the outcome and the errors are
+-- exactly those of the Lua implementation. An error raised here
+-- (e.g. 'Unknown mode') propagates through the C code to the
+-- client the same way the Lua wrapper would raise it.
+--
+function storage_c.helpers.full_call(args_mp)
+    local a = lmsgpack.decode(args_mp)
+    return storage_c.encode_reply(storage_call(a[1], a[2], a[3], a[4]))
+end
+
+--
 -- Bind a new storage ref to the current box session. Is used as a part of
 -- Map-Reduce API.
 --
@@ -3853,6 +4139,7 @@ local function master_on_disable()
     if rs.master ~= nil then
         rs:update_master(rs.master.id, nil)
     end
+    storage_c.identity_update()
     M._on_master_disable:run()
     master_role_update()
     rebalancer_role_update()
@@ -3867,6 +4154,7 @@ local function master_on_enable()
         local old_master_id = rs.master and rs.master.id
         M.this_replicaset:update_master(old_master_id, M.this_replica.id)
     end
+    storage_c.identity_update()
     M._on_master_enable:run()
     master_role_update()
     rebalancer_role_update()
@@ -4239,6 +4527,10 @@ local function storage_cfg_xc(cfgctx)
     -- to take it into account. For example, to know that the _bucket was
     -- created and is protected with all the triggers.
     storage_cfg_services_update()
+    if storage_c.is_requested() then
+        storage_c.enable()
+        storage_c.identity_update()
+    end
     -- Destroy connections, not used in a new configuration.
     collectgarbage()
 end
@@ -4280,7 +4572,7 @@ local function storage_buckets_info(bucket_id)
     local ibuckets = setmetatable({}, { __serialize = 'mapping' })
 
     for _, bucket in box.space._bucket:pairs({bucket_id}) do
-        local ref = M.bucket_refs[bucket.id]
+        local ref = brefs.get(bucket.id)
         local generation = bucket.opts and bucket.opts.generation or 0
         local desc = {
             id = bucket.id,

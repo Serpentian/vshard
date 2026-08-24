@@ -3,6 +3,7 @@ if(APPLE)
 endif(APPLE)
 
 add_subdirectory(storage)
+add_subdirectory(storage_c)
 add_subdirectory(router)
 
 # Install module

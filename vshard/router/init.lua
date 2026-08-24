@@ -29,6 +29,17 @@ local map_serializer = { __serialize = 'map' }
 local future_wait = util.future_wait
 
 local msgpack_is_object = lmsgpack.is_object
+--
+-- Prototype toggle: route the requests to the C implementation
+-- of the storage-side call. See vshard/storage_c/.
+--
+local STORAGE_CALL_NAME = 'vshard.storage.call'
+do
+    local v = os.getenv('VSHARD_C_CALL')
+    if v ~= nil and v ~= '' and v ~= '0' then
+        STORAGE_CALL_NAME = 'vshard.storage_c.call'
+    end
+end
 
 if not util.feature.msgpack_object then
     local msg = 'Msgpack object feature is not supported by current '..
@@ -642,7 +653,7 @@ local function router_call_impl(router, bucket_id, mode, prefer_replica,
 ::replicaset_is_found::
             opts.timeout = tend - fiber_clock()
             local storage_call_status, call_status, call_error =
-                replicaset[call](replicaset, 'vshard.storage.call',
+                replicaset[call](replicaset, STORAGE_CALL_NAME,
                                  {bucket_id, mode, func, args}, opts)
             if do_return_raw and msgpack_is_object(storage_call_status) then
                 -- Storage.call returns in the first value a flag whether user's
